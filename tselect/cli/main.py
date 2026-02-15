@@ -152,16 +152,19 @@ def main():
             else:
                 status = "PASSED"
 
+            return_code, passed, failed, skipped = execute_command(cmd)
+
             generate_summary(
                 components=components,
                 total_tests=total_tests,
                 duration=duration,
-                status=status,
+                status="PASSED" if return_code == 0 else "FAILED",
                 baseline=baseline_time,
                 passed=passed,
                 failed=failed,
                 skipped=skipped,
             )
+
 
     # ==========================================================
     # BASELINE COMMAND

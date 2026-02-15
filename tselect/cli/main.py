@@ -145,12 +145,22 @@ def main():
                 save_cache(repo_root, cache)
                 baseline_time = duration
 
+            if failed > 0 and passed > 0:
+                status = "PARTIAL_FAIL"
+            elif failed > 0:
+                status = "FAILED"
+            else:
+                status = "PASSED"
+
             generate_summary(
                 components=components,
                 total_tests=total_tests,
                 duration=duration,
-                status="PASSED" if return_code == 0 else "FAILED",
+                status=status,
                 baseline=baseline_time,
+                passed=passed,
+                failed=failed,
+                skipped=skipped,
             )
 
     # ==========================================================
@@ -171,7 +181,7 @@ def main():
             return
 
         start_time = time.time()
-        return_code = execute_command(cmd)
+        return_code, passed, failed, skipped = execute_command(cmd)
         duration = time.time() - start_time
 
         cache = load_cache(repo_root) or {}

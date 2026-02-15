@@ -29,7 +29,7 @@ def build_pytest_command(selected_classes):
 
 
     return cmd
-    
+
 
 def execute_command(cmd):
     process = subprocess.run(
@@ -43,16 +43,20 @@ def execute_command(cmd):
 
     passed = failed = skipped = 0
 
-    # Parse pytest summary line
-    match = re.search(
-        r"(\d+) passed.*?(\d+) failed.*?(\d+) skipped",
-        process.stdout,
-        re.IGNORECASE,
-    )
+    output = process.stdout + process.stderr
 
-    if match:
-        passed = int(match.group(1))
-        failed = int(match.group(2))
-        skipped = int(match.group(3))
+    # Robust parsing (order independent)
+    passed_match = re.search(r"(\d+)\s+passed", output)
+    failed_match = re.search(r"(\d+)\s+failed", output)
+    skipped_match = re.search(r"(\d+)\s+skipped", output)
+
+    if passed_match:
+        passed = int(passed_match.group(1))
+
+    if failed_match:
+        failed = int(failed_match.group(1))
+
+    if skipped_match:
+        skipped = int(skipped_match.group(1))
 
     return process.returncode, passed, failed, skipped

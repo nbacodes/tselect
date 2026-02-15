@@ -1,3 +1,4 @@
+import re
 import subprocess
 from pathlib import Path
 import sys
@@ -28,8 +29,30 @@ def build_pytest_command(selected_classes):
 
 
     return cmd
-
+    
 
 def execute_command(cmd):
-    result = subprocess.run(cmd)
-    return result.returncode
+    process = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True
+    )
+
+    print(process.stdout)
+    print(process.stderr)
+
+    passed = failed = skipped = 0
+
+    # Parse pytest summary line
+    match = re.search(
+        r"(\d+) passed.*?(\d+) failed.*?(\d+) skipped",
+        process.stdout,
+        re.IGNORECASE,
+    )
+
+    if match:
+        passed = int(match.group(1))
+        failed = int(match.group(2))
+        skipped = int(match.group(3))
+
+    return process.returncode, passed, failed, skipped

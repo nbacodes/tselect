@@ -136,7 +136,7 @@ def main():
         # ------------------------------------------------------
         if args.execute:
             start_time = time.time()
-            return_code = execute_command(cmd)
+            return_code, passed, failed, skipped = execute_command(cmd)
             duration = time.time() - start_time
 
             if baseline_time is None:

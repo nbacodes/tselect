@@ -20,7 +20,7 @@ from tselect.adapters.git_adapter import get_changed_files
 def pretty_print_command(cmd, hint):
     print("\n=== TSELECT COMMAND ===\n")
 
-    pytest_parts = cmd[1:] if len(cmd) > 3 else cmd
+    pytest_parts = cmd[3:] if len(cmd) > 3 else cmd
 
     print("pytest \\")
     for part in pytest_parts:
@@ -29,7 +29,6 @@ def pretty_print_command(cmd, hint):
     print("\nTo execute:")
     print(hint)
     print()
-
 
 # ==========================================================
 # Main

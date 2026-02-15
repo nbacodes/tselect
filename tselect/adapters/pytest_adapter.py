@@ -20,51 +20,50 @@ def build_pytest_command(selected_classes):
     # Build OR filter
     k_expr = " or ".join(class_names)
 
-    cmd = ["pytest"]
+    cmd = [sys.executable, "-m", "pytest"]   # ✅ safer than "pytest"
 
     cmd += list(files)
 
-    k_expr = " or ".join(class_names)
     cmd += ["-k", f"({k_expr})"]
 
+    cmd += ["-vv"]          # live progress + detailed output
+    cmd += ["--color=yes"]  # nice colored logs
 
     return cmd
 
 
 def execute_command(cmd):
-    process = subprocess.run(
+    process = subprocess.Popen(
         cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        capture_output=True
+        bufsize=1,
+        universal_newlines=True,
     )
 
-    # show live output
-    print(process.stdout)
-    print(process.stderr)
+    full_output = ""
+
+    # 🔥 STREAM OUTPUT LIVE
+    for line in process.stdout:
+        print(line, end="")     # realtime logs
+        full_output += line
+
+    process.wait()
 
     passed = failed = skipped = 0
 
-    # 🔥 IMPORTANT — this must be INSIDE the function
-    full_output = process.stdout + process.stderr
+    passed_match = re.search(r"(\d+)\s+passed", full_output, re.IGNORECASE)
+    failed_match = re.search(r"(\d+)\s+failed", full_output, re.IGNORECASE)
+    skipped_match = re.search(r"(\d+)\s+skipped", full_output, re.IGNORECASE)
 
-    summary_match = re.search(
-        r"=+\s*(.*?)\s*in\s*[\d\.]+s\s*=+",
-        full_output,
-        re.DOTALL
-    )
+    if passed_match:
+        passed = int(passed_match.group(1))
 
-    if summary_match:
-        summary_text = summary_match.group(1)
+    if failed_match:
+        failed = int(failed_match.group(1))
 
-        passed_match = re.search(r"(\d+)\s+passed", summary_text)
-        failed_match = re.search(r"(\d+)\s+failed", summary_text)
-        skipped_match = re.search(r"(\d+)\s+skipped", summary_text)
-
-        if passed_match:
-            passed = int(passed_match.group(1))
-        if failed_match:
-            failed = int(failed_match.group(1))
-        if skipped_match:
-            skipped = int(skipped_match.group(1))
+    if skipped_match:
+        skipped = int(skipped_match.group(1))
 
     return process.returncode, passed, failed, skipped

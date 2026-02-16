@@ -20,7 +20,7 @@ def build_pytest_command(selected_classes):
     # Build OR filter
     k_expr = " or ".join(class_names)
 
-    cmd = [sys.executable, "-m", "pytest"]   # ✅ safer than "pytest"
+    cmd = [sys.executable, "-m", "pytest"]
 
     cmd += list(files)
 
@@ -44,7 +44,7 @@ def execute_command(cmd):
 
     full_output = ""
 
-    # 🔥 STREAM OUTPUT LIVE
+    #OUTPUT LIVE
     for line in process.stdout:
         print(line, end="")     # realtime logs
         full_output += line

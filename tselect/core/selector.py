@@ -12,8 +12,6 @@ def map_files_to_components(changed_files: List[str], ownership: Dict) -> Set[st
 
     return affected
 
-
-
 def collect_tests_from_components(components: Set[str], test_json: Dict):
     """
     Returns:

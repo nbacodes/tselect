@@ -7,6 +7,7 @@ from tselect.core.selector import (
     map_files_to_components,
     collect_tests_from_components,
 )
+
 from tselect.adapters.pytest_adapter import build_pytest_command, execute_command
 from tselect.reporting.summary import generate_summary
 from tselect.reporting.cache import load_cache, save_cache
@@ -16,9 +17,8 @@ from tselect.utils.logger import setup_logger
 
 logger = setup_logger()
 
-# ==========================================================
 #  Pretty Printer
-# ==========================================================
+
 def pretty_print_command(cmd, hint):
     logger.debug("Preparing pretty print for pytest command")
 
@@ -34,9 +34,8 @@ def pretty_print_command(cmd, hint):
     print(hint)
     print()
 
-# ==========================================================
 # Main
-# ==========================================================
+
 def main():
     logger.debug("Initializing CLI parser")
 
@@ -53,9 +52,8 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command")
 
-    # ----------------------------------------------------------
     # RUN COMMAND
-    # ----------------------------------------------------------
+
     run_parser = subparsers.add_parser("run", help="Select tests to run")
 
     run_parser.add_argument(
@@ -71,9 +69,8 @@ def main():
         help="Execute selected tests",
     )
 
-    # ----------------------------------------------------------
     # BASELINE COMMAND
-    # ----------------------------------------------------------
+
     baseline_parser = subparsers.add_parser(
         "baseline", help="Create baseline timing"
     )
@@ -91,15 +88,13 @@ def main():
         logger.debug("Debug logging enabled")
 
 
-    # ==========================================================
     # RUN COMMAND LOGIC
-    # ==========================================================
+
     if args.command == "run":
         logger.info("Starting selective test run")
 
         repo_root = Path.cwd()
         logger.debug(f"Repository root: {repo_root}")
-
 
         ownership_path = repo_root / "ownership.yaml"
         json_path = repo_root / "config" / "testSuiteTorchInductor.json"
@@ -112,13 +107,11 @@ def main():
 
         logger.debug(f"Loaded cache: {cache}")
 
-
         ownership = load_yaml(ownership_path)
         test_json = load_json(json_path)
 
-        # ------------------------------------------------------
         # NEW: AUTO GIT DETECTION
-        # ------------------------------------------------------
+
         if args.changed:
             logger.info("Using manually provided changed files")
             changed_files = args.changed
@@ -133,9 +126,7 @@ def main():
         for f in changed_files:
             print("-", f)
 
-        # ------------------------------------------------------
         # COMPONENT MAPPING
-        # ------------------------------------------------------
         
         logger.info("Mapping files to components")
         components = map_files_to_components(changed_files, ownership)
@@ -144,7 +135,6 @@ def main():
         logger.info(f"Mapped to {len(components)} components")
         logger.debug(f"Components: {components}")
         logger.info("Collecting test classes from components")
-
 
         selected_classes, class_test_count = collect_tests_from_components(
             components,
@@ -171,9 +161,8 @@ def main():
 
         pretty_print_command(cmd, "tselect run --execute")
 
-        # ------------------------------------------------------
         # EXECUTION
-        # ------------------------------------------------------
+
         if args.execute:
             logger.info("Executing pytest run")
 
@@ -214,10 +203,8 @@ def main():
                 skipped=skipped,
             )
 
-
-    # ==========================================================
     # BASELINE COMMAND
-    # ==========================================================
+
     elif args.command == "baseline":
         logger.info("Running baseline detection")
 
@@ -226,7 +213,6 @@ def main():
         cmd = detect_baseline_command(repo_root)
 
         logger.debug(f"Baseline command detected: {cmd}")
-
 
         print("\n=== BASELINE COMMAND ===")
         print(" ".join(cmd))

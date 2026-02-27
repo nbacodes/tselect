@@ -1,7 +1,6 @@
 from pathlib import Path
 from .loader import load_yaml
 
-
 def load_tselect_config(repo_root: Path):
     config_path = repo_root / "tselect.yaml"
 

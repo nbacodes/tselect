@@ -3,7 +3,6 @@ import subprocess
 from pathlib import Path
 import sys
 
-
 def build_pytest_command(selected_classes):
     """
     Build pytest command using -k filter instead of ::Class.
@@ -19,18 +18,13 @@ def build_pytest_command(selected_classes):
 
     # Build OR filter
     k_expr = " or ".join(class_names)
-
     cmd = [sys.executable, "-m", "pytest"]
-
     cmd += list(files)
-
     cmd += ["-k", f"({k_expr})"]
-
     cmd += ["-vv"]          # live progress + detailed output
     cmd += ["--color=yes"]  # nice colored logs
 
     return cmd
-
 
 def execute_command(cmd):
     process = subprocess.Popen(
@@ -45,6 +39,7 @@ def execute_command(cmd):
     full_output = ""
 
     #OUTPUT LIVE
+    
     for line in process.stdout:
         print(line, end="")     # realtime logs
         full_output += line

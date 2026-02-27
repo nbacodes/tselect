@@ -1,6 +1,5 @@
 import subprocess
 
-
 def get_changed_files():
     try:
         result = subprocess.run(
@@ -11,6 +10,7 @@ def get_changed_files():
         )
         files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
         return files
+        
     except Exception as e:
         print("Failed to detect changed files from git:", e)
         return []

@@ -1,6 +1,5 @@
 from typing import List, Set, Dict
 
-
 def map_files_to_components(changed_files: List[str], ownership: Dict) -> Set[str]:
     affected = set()
 
@@ -18,10 +17,10 @@ def collect_tests_from_components(components: Set[str], test_json: Dict):
         selected_classes: Set[str]
         class_test_count: Dict[str, int]
     """
-
+    
     selected_classes = set()
     class_test_count = {}
-
+ 
     test_root = test_json.get("test_root", "")
     all_components = test_json.get("components", {})
 
@@ -30,7 +29,6 @@ def collect_tests_from_components(components: Set[str], test_json: Dict):
 
         for test_file, classes in files.items():
             for cls, data in classes.items():
-
                 class_id = f"{test_root}/{test_file}::{cls}"
                 selected_classes.add(class_id)
 

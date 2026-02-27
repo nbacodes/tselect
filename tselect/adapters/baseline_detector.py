@@ -1,7 +1,6 @@
 from pathlib import Path
 from tselect.utils.loader import load_json
 
-
 def detect_baseline_command(repo_root: Path):
     """
     Detect baseline command generically using project JSON.
@@ -19,6 +18,7 @@ def detect_baseline_command(repo_root: Path):
             print("\nDetected PyTest project")
             print(f"Using test_root from JSON: {test_root}")
 
+            # Currently for pytest
             return [
                 "python",
                 "-m",

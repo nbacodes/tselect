@@ -1,25 +1,46 @@
-import json
+"""
+graph_builder.py
+----------------
+Builds the dependency graph for tselect.
+
+Two-phase build:
+  Phase 1: AST parsing  → reverse graph (source file → test files that import it)
+  Phase 2: pytest --collect-only → test inventory (actual runnable class names)
+
+Using pytest --collect-only for Phase 2 is critical because:
+  - PyTorch uses instantiate_device_type_tests() which generates class names
+    like TestSchedulerCPU at runtime — invisible to static AST parsing
+  - pytest --collect-only naturally skips tests that can't be imported
+    (e.g. distributed tests requiring CUDA on Mac) — no manual filtering needed
+  - Works for any repo regardless of how tests are structured
+"""
+
 import ast
-from pathlib import Path
+import json
+import subprocess
+import sys
+import time
 from collections import defaultdict
+from pathlib import Path
 
 
 class GraphBuilder:
     def __init__(self, layout):
-        self.layout = layout
-        self.repo_root = layout.repo_root
-        self.language = layout.language
+        self.layout     = layout
+        self.repo_root  = layout.repo_root
+        self.language   = layout.language
         self.source_files = layout.source_files
-        self.test_files = layout.test_files
+        self.test_files   = layout.test_files
 
-    # ---------------------------
-    # Python import extraction
-    # ---------------------------
-    def _extract_python_imports(self, file_path: Path):
+    # ─────────────────────────────────────────────
+    # PHASE 1: AST import extraction
+    # ─────────────────────────────────────────────
+
+    def _extract_python_imports(self, file_path: Path) -> set:
         imports = set()
-
         try:
-            tree = ast.parse(file_path.read_text())
+            source = file_path.read_text(encoding="utf-8", errors="ignore")
+            tree   = ast.parse(source)
         except Exception:
             return imports
 
@@ -31,71 +52,220 @@ class GraphBuilder:
             elif isinstance(node, ast.ImportFrom):
                 if node.module:
                     imports.add(node.module)
+                    for alias in node.names:
+                        if alias.name != "*":
+                            imports.add(f"{node.module}.{alias.name}")
 
         return imports
 
-    # ---------------------------
-    # Generic import dispatcher
-    # ---------------------------
-    def extract_imports(self, file_path: Path):
+    def extract_imports(self, file_path: Path) -> set:
         if self.language == "python":
             return self._extract_python_imports(file_path)
-
-        # future: tree-sitter integration
+        # future: tree-sitter for C++, Java, Go, Rust
         return set()
 
-    # ---------------------------
-    # Build dependency graph
-    # ---------------------------
-    def build(self):
-        forward_graph = defaultdict(set)
-
-        # Map module path to file
-        module_map = {}
-
-        for src in self.source_files:
-            rel = src.relative_to(self.repo_root)
-            module_name = ".".join(rel.with_suffix("").parts)
-            module_map[module_name] = str(rel)
-
-        # Build forward graph
-        for src in self.source_files:
-            rel = src.relative_to(self.repo_root)
-            module_name = ".".join(rel.with_suffix("").parts)
-
-            imports = self.extract_imports(src)
-
-            for imp in imports:
-                if imp in module_map:
-                    forward_graph[module_name].add(imp)
-
-        # Reverse graph: source_file → tests
+    def _build_reverse_graph(self, module_map: dict) -> dict:
+        """
+        Build: source_file → set of test files that directly import it.
+        Direct imports only — no transitive expansion.
+        Transitive caused 6000+ tests to be selected (config.py blast radius).
+        """
         reverse_graph = defaultdict(set)
 
         for test in self.test_files:
-            imports = self.extract_imports(test)
-
             rel_test = str(test.relative_to(self.repo_root))
+            imports  = self.extract_imports(test)
 
             for imp in imports:
                 if imp in module_map:
                     src_file = module_map[imp]
                     reverse_graph[src_file].add(rel_test)
 
+        return {k: sorted(v) for k, v in reverse_graph.items()}
+
+    # ─────────────────────────────────────────────
+    # PHASE 2: pytest --collect-only for inventory
+    # ─────────────────────────────────────────────
+
+    def _collect_batch(self, batch: list) -> str:
+        """
+        Run pytest --collect-only on a small batch of files.
+        Returns stdout string, or empty string on failure/timeout.
+        --continue-on-collection-errors means one bad import (e.g. distributed)
+        doesn't abort the whole batch.
+        """
+        cmd = [
+            sys.executable, "-m", "pytest",
+            "--collect-only", "-q", "--no-header",
+            "--continue-on-collection-errors",  # key: skip files that fail to import
+        ] + batch
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(self.repo_root),
+                timeout=30,  # 30s per batch of 50 files — plenty
+            )
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            return ""
+        except Exception:
+            return ""
+
+    def _build_test_inventory(self, candidate_test_files: list) -> dict:
+        """
+        Run pytest --collect-only in batches to get actual runnable test node IDs.
+
+        Batching solves two problems:
+          1. Timeout — 1256 files at once exceeds 120s, but 50 files at a time
+             takes ~3s per batch, ~75s total for 1256 files
+          2. Distributed import failures — with --continue-on-collection-errors,
+             a failed import in one file doesn't abort the rest of the batch.
+             PyTorch distributed tests that need compiled CUDA just get skipped.
+
+        Also gets real runtime class names:
+          TestScheduler → TestSchedulerCPU (from instantiate_device_type_tests)
+        """
+        if not candidate_test_files:
+            return {}
+
+        BATCH_SIZE = 50
+        batches    = [
+            candidate_test_files[i:i + BATCH_SIZE]
+            for i in range(0, len(candidate_test_files), BATCH_SIZE)
+        ]
+
+        print(f"    Collecting {len(candidate_test_files)} files in {len(batches)} batches of {BATCH_SIZE}...")
+
+        inventory  = defaultdict(lambda: defaultdict(lambda: {"node_ids": [], "test_count": 0}))
+        successful = 0
+
+        for i, batch in enumerate(batches):
+            stdout = self._collect_batch(batch)
+            if not stdout:
+                continue
+
+            for line in stdout.splitlines():
+                line = line.strip()
+                if "::" not in line or line.startswith("ERROR") or line.startswith("Warning"):
+                    continue
+
+                parts = line.split("::")
+                if len(parts) < 3:
+                    continue
+
+                test_file  = parts[0]
+                class_name = parts[1].split("[")[0]  # strip [cpu]/[cuda] suffix
+                node_id    = f"{test_file}::{class_name}::{parts[2].split('[')[0]}"
+
+                inventory[test_file][class_name]["node_ids"].append(node_id)
+                inventory[test_file][class_name]["test_count"] += 1
+                successful += 1
+
+            # progress indicator every 5 batches
+            if (i + 1) % 5 == 0 or (i + 1) == len(batches):
+                print(f"    [{i+1}/{len(batches)} batches] {successful} test methods collected so far")
+
+        if successful == 0:
+            print("    ⚠️  Collection returned no results — falling back to AST inventory")
+            return self._build_ast_inventory(candidate_test_files)
+
         return {
-            "language": self.language,
-            "full_reverse_graph": {
-                k: sorted(list(v)) for k, v in reverse_graph.items()
-            }
+            tf: {cls: dict(data) for cls, data in classes.items()}
+            for tf, classes in inventory.items()
         }
 
-    # ---------------------------
-    # Save graph to disk
-    # ---------------------------
-    def save(self, graph_data):
-        graph_dir = self.repo_root / ".graph" / "tselect"
-        graph_dir.mkdir(parents=True, exist_ok=True)
+    def _build_ast_inventory(self, test_files: list) -> dict:
+        """
+        Fallback: AST-based inventory when pytest --collect-only fails.
+        Less accurate for repos using dynamic test generation.
+        """
+        inventory = {}
 
+        for test_path_str in test_files:
+            test_path = self.repo_root / test_path_str
+            if not test_path.exists():
+                continue
+
+            try:
+                source = test_path.read_text(encoding="utf-8", errors="ignore")
+                tree   = ast.parse(source)
+            except Exception:
+                continue
+
+            classes = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    is_test = (
+                        node.name.startswith("Test") or
+                        node.name.endswith("Test") or
+                        node.name.endswith("Tests")
+                    )
+                    if is_test:
+                        methods = [
+                            item.name for item in node.body
+                            if isinstance(item, ast.FunctionDef)
+                            and item.name.startswith("test_")
+                        ]
+                        if methods:
+                            classes[node.name] = {
+                                "node_ids": [
+                                    f"{test_path_str}::{node.name}::{m}"
+                                    for m in methods
+                                ],
+                                "test_count": len(methods),
+                            }
+
+            if classes:
+                inventory[test_path_str] = classes
+
+        return inventory
+
+    # ─────────────────────────────────────────────
+    # BUILD: combine both phases
+    # ─────────────────────────────────────────────
+
+    def build(self) -> dict:
+        print("  Phase 1: Building import graph via AST...")
+        t0 = time.time()
+
+        # module dotted name → relative file path
+        module_map = {}
+        for src in self.source_files:
+            rel = src.relative_to(self.repo_root)
+            module_name = ".".join(rel.with_suffix("").parts)
+            module_map[module_name] = str(rel)
+
+        reverse_graph = self._build_reverse_graph(module_map)
+        print(f"    Done in {time.time() - t0:.2f}s — {len(reverse_graph)} source files indexed")
+
+        print("  Phase 2: Building test inventory via pytest --collect-only...")
+        t1 = time.time()
+
+        # collect all unique test files that appear in reverse graph
+        all_candidate_tests = sorted(set(
+            tf for tests in reverse_graph.values() for tf in tests
+        ))
+
+        test_inventory = self._build_test_inventory(all_candidate_tests)
+        print(f"    Done in {time.time() - t1:.2f}s — {len(test_inventory)} test files indexed")
+
+        return {
+            "language":          self.language,
+            "full_reverse_graph": reverse_graph,
+            "test_inventory":    test_inventory,
+            "built_at":          time.time(),
+        }
+
+    # ─────────────────────────────────────────────
+    # SAVE
+    # ─────────────────────────────────────────────
+
+    def save(self, graph_data: dict) -> Path:
+        graph_dir  = self.repo_root / ".graph" / "tselect"
+        graph_dir.mkdir(parents=True, exist_ok=True)
         graph_path = graph_dir / "dependency_graph.json"
 
         with open(graph_path, "w") as f:

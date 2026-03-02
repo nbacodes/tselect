@@ -48,6 +48,10 @@ class RepoLayoutInferer:
         if not counter:
             raise RuntimeError("Could not detect repo language.")
 
+        # Prefer Python if present (since TSelect itself is Python)
+        if "python" in counter:
+            return "python"
+
         return counter.most_common(1)[0][0]
 
     # -----------------------

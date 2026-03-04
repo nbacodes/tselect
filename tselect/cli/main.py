@@ -4,19 +4,14 @@ cli/main.py
 tselect CLI — zero user hardship design.
 
 Commands:
-  tselect build-graph          → auto-build dependency graph (run once)
-  tselect run                  → auto-detect changed files via git, select tests
-  tselect run --execute        → select + run tests
-  tselect run --changed f1 f2  → manually specify changed files
-  tselect baseline --execute   → record full suite baseline time
+  tselect init             → generate tselect.yaml for this repo
+  tselect build-graph      → build dependency graph (run once)
+  tselect run              → auto-detect changes, select + optionally run tests
+  tselect run --execute    → select + run tests
+  tselect baseline --execute → record full suite baseline time
 
-Design principles:
-  - No manual JSON files needed
-  - No ownership.yaml needed  
-  - Auto git detection — user never needs to type file paths
-  - Auto stale graph detection — warns when graph needs rebuild
-  - Falls back to legacy mode if no graph built yet
-  - Clear, informative output at every step
+Config is read from tselect.yaml at repo root on every run.
+Falls back to sensible defaults if tselect.yaml is missing.
 """
 
 import argparse
@@ -24,6 +19,7 @@ import time
 from pathlib import Path
 
 from tselect.utils.loader import load_yaml, load_json
+from tselect.utils.config_loader import load_tselect_config, should_ignore_file
 from tselect.core.selector import map_files_to_components, collect_tests_from_components
 from tselect.core.graph_loader import GraphLoader
 from tselect.core.graph_selector import (
@@ -44,43 +40,50 @@ from tselect.utils.logger import setup_logger
 
 logger = setup_logger()
 
-# graph is considered stale after 7 days
-GRAPH_STALE_DAYS = 7
-
 
 # ─────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────
 
-def _is_graph_stale(graph: dict) -> bool:
-    """Check if graph was built more than GRAPH_STALE_DAYS ago."""
+def _is_graph_stale(graph: dict, rebuild_after_days: int) -> bool:
     built_at = graph.get("built_at")
     if not built_at:
-        return False  # old graph without timestamp — don't force rebuild
+        return False
     age_days = (time.time() - built_at) / 86400
-    return age_days > GRAPH_STALE_DAYS
+    return age_days > rebuild_after_days
+
+
+def _print_header(title: str):
+    print()
+    print("=" * 60)
+    print(f"  {title}")
+    print("=" * 60)
 
 
 def _print_section(title: str):
-    print(f"\n{'─' * 60}")
-    print(f"  {title}")
-    print(f"{'─' * 60}")
-
-
-def _pretty_print_command(node_ids: list[str]):
-    """Print the pytest command in a readable format."""
-    print("\n=== TSELECT COMMAND ===\n")
-    print("pytest \\")
-    for nid in node_ids:
-        print(f"  {nid} \\")
-    print("\nTo execute:")
-    print("  tselect run --execute")
     print()
+    print(f"  {'─' * 56}")
+    print(f"  {title}")
+    print(f"  {'─' * 56}")
 
 
-# ─────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────
+def _filter_changed_files(changed_files: list, ignore_patterns: list) -> tuple[list, list]:
+    """
+    Split changed files into actionable (source) and ignored (data/config).
+    Returns (actionable, ignored).
+    """
+    actionable = []
+    ignored    = []
+
+    for f in changed_files:
+        filename = Path(f).name
+        if should_ignore_file(filename, ignore_patterns):
+            ignored.append(f)
+        else:
+            actionable.append(f)
+
+    return actionable, ignored
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -92,10 +95,16 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command")
 
+    # ── init ──
+    subparsers.add_parser(
+        "init",
+        help="Generate a starter tselect.yaml for this repo",
+    )
+
     # ── build-graph ──
     subparsers.add_parser(
         "build-graph",
-        help="Auto-build dependency graph from repo (run once, re-run when repo structure changes)",
+        help="Build dependency graph (run once, or when repo structure changes)",
     )
 
     # ── run ──
@@ -118,7 +127,7 @@ def main():
     # ── baseline ──
     baseline_parser = subparsers.add_parser(
         "baseline",
-        help="Record full test suite baseline time",
+        help="Record full test suite baseline time for comparison",
     )
     baseline_parser.add_argument("--execute", action="store_true")
 
@@ -127,28 +136,53 @@ def main():
     if args.debug:
         logger.setLevel("DEBUG")
 
+    repo_root = Path.cwd()
+
+    # ── load config (every command reads it) ──
+    config          = load_tselect_config(repo_root)
+    ignore_patterns = config["runner"]["ignore_changed_patterns"]
+    rebuild_days    = config["graph"]["rebuild_after_days"]
+
+    # ─────────────────────────────────────────────
+    # INIT
+    # ─────────────────────────────────────────────
+
+    if args.command == "init":
+        from tselect.core.init_command import run_init
+        run_init(repo_root)
+
     # ─────────────────────────────────────────────
     # BUILD-GRAPH
     # ─────────────────────────────────────────────
 
-    if args.command == "build-graph":
+    elif args.command == "build-graph":
         logger.info("Building dependency graph")
 
         from tselect.core.layout import RepoLayoutInferer
-        from tselect.core.graph_builder import GraphBuilder
+        from tselect.core.graph_builder import GraphBuilder, UnsupportedLanguageError
 
-        repo_root = Path.cwd()
+        _print_header("tselect — Building Dependency Graph")
+        print(f"  Repo   : {repo_root}")
+
+        if (repo_root / "tselect.yaml").exists():
+            src  = config["repo"].get("source_dirs", [])
+            tst  = config["repo"].get("test_dirs", [])
+            print(f"  Source : {src}")
+            print(f"  Tests  : {tst}")
+        else:
+            print("  Config : no tselect.yaml found")
+            print("           Run 'tselect init' to generate one")
 
         print()
-        print("=" * 60)
-        print("  tselect — Building Dependency Graph")
-        print("=" * 60)
-        print(f"  Repo: {repo_root}")
-        print()
-
         print("► Scanning repository layout...")
-        layout  = RepoLayoutInferer(repo_root).infer()
-        builder = GraphBuilder(layout)
+
+        layout  = RepoLayoutInferer(repo_root, config).infer()
+
+        try:
+            builder = GraphBuilder(layout)
+        except UnsupportedLanguageError as e:
+            print(e)
+            return
 
         print(f"  Language  : {layout.language}")
         print(f"  Source    : {len(layout.source_files)} files")
@@ -162,13 +196,11 @@ def main():
 
         path = builder.save(graph)
 
-        reverse    = graph.get("full_reverse_graph", {})
-        inventory  = graph.get("test_inventory", {})
+        reverse   = graph.get("full_reverse_graph", {})
+        inventory = graph.get("test_inventory", {})
 
         print()
-        print("─" * 60)
         print("  ✅ Graph built successfully")
-        print("─" * 60)
         print(f"  Source files indexed  : {len(reverse)}")
         print(f"  Test files indexed    : {len(inventory)}")
         print(f"  Total build time      : {t_total:.1f}s")
@@ -185,7 +217,6 @@ def main():
         print("  Now run:")
         print("    tselect run")
         print("    tselect run --execute")
-        print()
 
     # ─────────────────────────────────────────────
     # RUN
@@ -193,43 +224,55 @@ def main():
 
     elif args.command == "run":
         logger.info("Starting selective test run")
-        repo_root = Path.cwd()
 
         cache         = load_cache(repo_root)
         baseline_time = cache.get("baseline_time")
 
-        print()
-        print("=" * 60)
-        print("  tselect — Targeted Test Selection")
-        print("=" * 60)
+        _print_header("tselect — Targeted Test Selection")
 
         # ── step 1: get changed files ──
         if args.changed:
             logger.info("Using manually provided changed files")
-            changed_files = args.changed
-            print(f"\n  Changed files (manual):")
+            all_changed = args.changed
+            source      = "manual"
         else:
             logger.info("Auto-detecting changed files via git diff")
-            changed_files = get_changed_files()
-            print(f"\n  Changed files (git diff):")
+            all_changed = get_changed_files()
+            source      = "git diff"
 
-        if not changed_files:
-            print("  No changed files detected. Nothing to run.")
+        if not all_changed:
+            print("\n  No changed files detected. Nothing to run.")
             return
 
+        # ── step 2: filter out non-source files ──
+        changed_files, ignored_files = _filter_changed_files(
+            all_changed, ignore_patterns
+        )
+
+        print(f"\n  Changed files ({source}):")
         for f in changed_files:
             print(f"    • {f}")
 
-        # ── step 2: load graph ──
+        if ignored_files:
+            print(f"\n  Ignored (non-source) files:")
+            for f in ignored_files:
+                print(f"    ○ {f}  ← data/config file, skipped")
+
+        if not changed_files:
+            print("\n  All changed files are non-source (data/config).")
+            print("  Nothing to test.")
+            return
+
+        # ── step 3: load graph ──
         graph_loader = GraphLoader(repo_root)
 
         if graph_loader.exists():
             graph = graph_loader.load()
 
             # warn if stale
-            if _is_graph_stale(graph):
+            if _is_graph_stale(graph, rebuild_days):
                 print()
-                print("  ⚠️  Dependency graph is older than 7 days.")
+                print(f"  ⚠️  Dependency graph is older than {rebuild_days} days.")
                 print("     Run 'tselect build-graph' to refresh it.")
 
             # ── GRAPH MODE ──
@@ -239,43 +282,42 @@ def main():
                 changed_files, graph, repo_root
             )
 
-            node_ids                        = get_pytest_node_ids(selected)
+            node_ids                           = get_pytest_node_ids(selected)
             selected_classes, class_test_count = get_summary_info(selected)
 
-            # components for summary
-            components = sorted(set(
-                Path(f).stem for f in changed_files
-            ))
+            components = sorted(set(Path(f).stem for f in changed_files))
 
-            print()
-            print("─" * 60)
-            print(f"  Selected: {len(selected)} test files, "
-                  f"{len(selected_classes)} classes, "
-                  f"{len(node_ids)} test methods")
-            print("─" * 60)
+            _print_section(
+                f"Selected: {len(selected)} test files, "
+                f"{len(selected_classes)} classes, "
+                f"{len(node_ids)} test methods"
+            )
 
             for test_file, data in selected.items():
                 triggered = ", ".join(data["triggered_by"])
                 print(f"\n  📄 {test_file}")
-                print(f"     ← triggered by: {triggered}")
+                print(f"     ← {triggered}")
                 for cls_name, cls_data in data["classes"].items():
                     print(f"     • {cls_name} ({cls_data['test_count']} tests)")
 
             if not node_ids:
-                print("\n  No runnable tests found for changed files.")
+                print("\n  No runnable tests found for the changed files.")
                 print("  Possible reasons:")
-                print("    • Changed files have no test coverage in graph")
-                print("    • Run 'tselect build-graph' to rebuild graph")
+                print("    • Changed files have no tests in the dependency graph")
+                print("    • Run 'tselect build-graph' to rebuild the graph")
+                print("    • Check source_dirs in tselect.yaml covers these files")
                 return
 
-            _pretty_print_command(node_ids)
-            cmd = build_pytest_command(node_ids)
+            cmd = build_pytest_command(
+                node_ids,
+                extra_args=config["runner"]["extra_args"]
+            )
 
         else:
             # ── LEGACY MODE ──
             print()
             print("  ⚠️  No dependency graph found.")
-            print("  Run 'tselect build-graph' first for best results.")
+            print("  Run 'tselect build-graph' first for auto mode.")
             print("  Falling back to ownership.yaml + manual JSON...\n")
 
             ownership_path = repo_root / "ownership.yaml"
@@ -290,7 +332,7 @@ def main():
             )
 
             total_tests = sum(class_test_count.values())
-            node_ids    = selected_classes  # file::class format
+            node_ids    = selected_classes
 
             print("  Selected classes:")
             for cls in selected_classes:
@@ -299,16 +341,25 @@ def main():
 
             cmd = build_pytest_command_from_classes(list(selected_classes))
 
-        # ── step 3: execute ──
+        # ── step 4: print command ──
+        print()
+        print("  " + "─" * 56)
+        print("  PYTEST COMMAND")
+        print("  " + "─" * 56)
+        print()
+        print("  pytest \\")
+        for nid in node_ids[:5]:
+            print(f"    {nid} \\")
+        if len(node_ids) > 5:
+            print(f"    ... and {len(node_ids) - 5} more")
+        print()
+        print("  To execute: tselect run --execute")
+
         if not args.execute:
-            print("  To execute, run:")
-            print("    tselect run --execute")
             return
 
-        print()
-        print("─" * 60)
-        print("  ► Executing tests...")
-        print("─" * 60)
+        # ── step 5: execute ──
+        _print_section("► Executing tests...")
         print()
 
         logger.info("Executing pytest run")
@@ -321,63 +372,65 @@ def main():
             f"(passed={passed}, failed={failed}, skipped={skipped})"
         )
 
-        # save baseline if none exists
+        # save baseline if none recorded yet
         if baseline_time is None:
-            logger.info("No baseline found — saving current run as baseline")
             print("\n  No baseline recorded yet — saving this run as baseline.")
             cache["baseline_time"] = duration
             save_cache(repo_root, cache)
             baseline_time = duration
 
-        # determine status
-        if failed > 0 and passed > 0:
-            status = "PARTIAL_FAIL"
-        elif failed > 0:
-            status = "FAILED"
-        else:
-            status = "PASSED"
+        status = (
+            "COLLECTION_ERROR" if passed == 0 and failed == 0 and skipped == 0 and return_code != 0
+            else "PARTIAL_FAIL" if failed > 0 and passed > 0
+            else "FAILED"       if failed > 0
+            else "PASSED"
+        )
 
-        logger.info("Generating execution summary")
+        if status == "COLLECTION_ERROR":
+            print()
+            print("  ❌ No tests ran — pytest encountered collection errors.")
+            print("     This usually means some test files have broken imports")
+            print("     (e.g. missing CUDA, distributed backend, or functorch).")
+            print()
+            print("  These files will be excluded from the graph on next rebuild.")
+            print("  Run: tselect build-graph")
+            print()
 
         generate_summary(
-            components=components,
-            total_tests=len(node_ids),
-            duration=duration,
-            status="PASSED" if return_code == 0 else status,
-            baseline=baseline_time,
-            passed=passed,
-            failed=failed,
-            skipped=skipped,
+            components  = components,
+            total_tests = len(node_ids),
+            duration    = duration,
+            status      = "PASSED" if return_code == 0 else status,
+            baseline    = baseline_time,
+            passed      = passed,
+            failed      = failed,
+            skipped     = skipped,
         )
+
+        # honour CI fail-on-failure setting
+        if config["ci"]["fail_on_test_failure"] and return_code != 0:
+            raise SystemExit(return_code)
 
     # ─────────────────────────────────────────────
     # BASELINE
     # ─────────────────────────────────────────────
 
     elif args.command == "baseline":
-        logger.info("Running baseline detection")
-        repo_root = Path.cwd()
-
+        logger.info("Running baseline")
         cmd = detect_baseline_command(repo_root)
-        logger.debug(f"Baseline command: {cmd}")
 
         print("\n=== BASELINE COMMAND ===")
         print(" ".join(cmd))
 
         if not args.execute:
-            print("\nRun with:")
-            print("  tselect baseline --execute")
+            print("\nRun with: tselect baseline --execute")
             return
-
-        logger.info("Executing baseline run")
 
         start_time = time.time()
         return_code, passed, failed, skipped = execute_command(cmd)
         duration = time.time() - start_time
 
-        logger.info(f"Baseline finished in {duration:.2f}s")
-
-        cache                = load_cache(repo_root) or {}
+        cache                  = load_cache(repo_root) or {}
         cache["baseline_time"] = duration
         save_cache(repo_root, cache)
 

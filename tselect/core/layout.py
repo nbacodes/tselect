@@ -21,7 +21,6 @@ The config-driven path solves the 33,782-file problem:
 from pathlib import Path
 from collections import Counter
 
-
 LANG_EXT_MAP = {
     ".py":   "python",
     ".js":   "javascript",
@@ -38,7 +37,6 @@ DEFAULT_IGNORE_DIRS = {
     ".git", "node_modules", "dist", "build",
     "__pycache__", ".venv", ".tox", ".eggs",
 }
-
 
 class RepoLayout:
     def __init__(self, repo_root, language, source_files, test_files):
@@ -132,7 +130,7 @@ class RepoLayoutInferer:
         for d in dirs:
             full_dir = self.repo_root / d
             if not full_dir.exists():
-                print(f"  ⚠️  Directory not found: {full_dir}")
+                print(f"  Directory not found: {full_dir}")
                 print(f"       Check 'source_dirs' / 'test_dirs' in tselect.yaml")
                 continue
 
@@ -202,7 +200,7 @@ class RepoLayoutInferer:
         else:
             # ── SLOW PATH: no config, scan entire repo ──
             print()
-            print("  ℹ️  No tselect.yaml found — scanning entire repo (may be slow).")
+            print("     No tselect.yaml found — scanning entire repo (may be slow).")
             print("     Add a tselect.yaml to speed this up significantly.")
             print("     Run: tselect init   (coming soon — generates tselect.yaml for you)")
             print()

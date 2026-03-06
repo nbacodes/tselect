@@ -4,18 +4,29 @@ graph_builder.py
 Builds the dependency graph for tselect.
 
 Two-phase build:
-  Phase 1: AST parsing  → reverse graph (source file → test files that import it)
-  Phase 2: pytest --collect-only in batches → test inventory (actual runnable class names)
+  Phase 1: AST parsing → TWO reverse graphs:
+             (a) file_reverse_graph:     source file  → test files that import it
+             (b) function_reverse_graph: source symbol → test files that reference it
 
-Supported languages for Phase 1:
-  python  → fully supported via ast module
-  others  → clear error message, not silently broken
+  Phase 2: pytest --collect-only in batches → test inventory
 
-Why batched pytest --collect-only:
-  - 1256 files at once → timeout (>120s)
-  - 50 files per batch → ~3s per batch, ~75s total
-  - --continue-on-collection-errors → distributed/CUDA tests that can't
-    import on Mac are silently skipped, not errors
+The function_reverse_graph enables function-level selection:
+  "_fuse_nodes() changed" → 2 test files  (instead of all 7 that import scheduler.py)
+
+How function references are detected — three import patterns:
+
+  Pattern A (most precise) — named import:
+      from torch._inductor.scheduler import Scheduler, _fuse_nodes
+      → records: scheduler.py::Scheduler, scheduler.py::_fuse_nodes
+
+  Pattern B — module alias + attribute access:
+      import torch._inductor.scheduler as sched
+      ...sched.try_fusions(...)
+      → records: scheduler.py::try_fusions
+
+  Pattern C (least precise) — bare module import:
+      import torch._inductor.scheduler
+      → records ALL public symbols of scheduler.py (conservative fallback)
 """
 
 import ast
@@ -27,8 +38,7 @@ from collections import defaultdict
 from pathlib import Path
 
 
-SUPPORTED_LANGUAGES = {"python"}
-
+SUPPORTED_LANGUAGES   = {"python"}
 COMING_SOON_LANGUAGES = {"java", "javascript", "typescript", "go", "cpp"}
 
 
@@ -37,96 +47,183 @@ class UnsupportedLanguageError(Exception):
 
 
 class GraphBuilder:
-    def __init__(self, layout):
+    def __init__(self, layout, config: dict = None):
         self.layout       = layout
         self.repo_root    = layout.repo_root
         self.language     = layout.language
         self.source_files = layout.source_files
         self.test_files   = layout.test_files
-        self.batch_size   = getattr(layout, "collect_batch_size", 50)
-
-        # validate language upfront — fail clearly, not silently
+        self.config       = config or {}
+        self.batch_size   = (
+            self.config.get("graph", {}).get("collect_batch_size", 50)
+            or getattr(layout, "collect_batch_size", 50)
+        )
         self._validate_language()
 
     def _validate_language(self):
         if self.language in SUPPORTED_LANGUAGES:
             return
-
         if self.language in COMING_SOON_LANGUAGES:
             raise UnsupportedLanguageError(
-                f"\n  ❌ Language '{self.language}' is not yet supported by tselect.\n"
-                f"\n"
-                f"  Currently supported: python\n"
+                f"\n  ❌ Language '{self.language}' is not yet supported.\n"
+                f"  Supported: python\n"
                 f"  Coming soon: java, javascript, typescript, go, cpp\n"
-                f"\n"
-                f"  If you'd like to help add {self.language} support:\n"
-                f"  → https://github.com/your-org/tselect/issues\n"
             )
-
         raise UnsupportedLanguageError(
             f"\n  ❌ Unknown language '{self.language}'.\n"
-            f"  Check 'repo.language' in your tselect.yaml.\n"
-            f"  Supported: python\n"
+            f"  Check 'repo.language' in tselect.yaml.\n"
         )
 
     # ─────────────────────────────────────────────
-    # PHASE 1: AST import extraction
+    # SOURCE: extract public symbols
     # ─────────────────────────────────────────────
 
-    def _extract_python_imports(self, file_path: Path) -> set:
-        imports = set()
+    def _extract_public_symbols(self, file_path: Path) -> set:
+        """
+        All top-level names from a source file.
+        Used for conservative fallback when test imports entire module.
+        """
+        symbols = set()
         try:
             source = file_path.read_text(encoding="utf-8", errors="ignore")
             tree   = ast.parse(source)
         except Exception:
-            return imports
+            return symbols
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imports.add(alias.name)
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imports.add(node.module)
-                    for alias in node.names:
-                        if alias.name != "*":
-                            imports.add(f"{node.module}.{alias.name}")
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                symbols.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        symbols.add(target.id)
 
-        return imports
-
-    def extract_imports(self, file_path: Path) -> set:
-        if self.language == "python":
-            return self._extract_python_imports(file_path)
-        return set()
-
-    def _build_reverse_graph(self, module_map: dict) -> dict:
-        """
-        Build: source_file → set of test files that directly import it.
-        Direct imports only — no transitive expansion.
-        """
-        reverse_graph = defaultdict(set)
-
-        for test in self.test_files:
-            rel_test = str(test.relative_to(self.repo_root))
-            imports  = self.extract_imports(test)
-
-            for imp in imports:
-                if imp in module_map:
-                    src_file = module_map[imp]
-                    reverse_graph[src_file].add(rel_test)
-
-        return {k: sorted(v) for k, v in reverse_graph.items()}
+        return symbols
 
     # ─────────────────────────────────────────────
-    # PHASE 2: pytest --collect-only for inventory
+    # TEST: extract symbol-level references
+    # ─────────────────────────────────────────────
+
+    def _extract_symbol_references(self, test_path: Path, module_map: dict) -> dict:
+        """
+        Parse a test file and return which symbols from which source files
+        it directly references.
+
+        Returns:
+            {
+                "torch/_inductor/scheduler.py": {"Scheduler", "_fuse_nodes"},
+                "torch/_inductor/lowering.py":  {"make_fallback"},
+            }
+        """
+        references = defaultdict(set)
+
+        try:
+            source = test_path.read_text(encoding="utf-8", errors="ignore")
+            tree   = ast.parse(source)
+        except Exception:
+            return references
+
+        # alias_map: local_name → (src_file, specific_sym_or_None)
+        alias_map = {}
+
+        for node in ast.walk(tree):
+
+            # Pattern A: from module import name1, name2
+            if isinstance(node, ast.ImportFrom) and node.module:
+                src_file = module_map.get(node.module)
+
+                if src_file:
+                    for alias in node.names:
+                        if alias.name == "*":
+                            src_path = self.repo_root / src_file
+                            references[src_file].update(
+                                self._extract_public_symbols(src_path)
+                            )
+                        else:
+                            references[src_file].add(alias.name)
+                            local = alias.asname or alias.name
+                            alias_map[local] = (src_file, alias.name)
+
+                # also: from torch._inductor import scheduler
+                for alias in node.names:
+                    child_mod = f"{node.module}.{alias.name}"
+                    child_src = module_map.get(child_mod)
+                    if child_src:
+                        src_path = self.repo_root / child_src
+                        references[child_src].update(
+                            self._extract_public_symbols(src_path)
+                        )
+                        local = alias.asname or alias.name
+                        alias_map[local] = (child_src, None)
+
+            # Pattern B/C: import module or import module as alias
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    src_file = module_map.get(alias.name)
+                    if src_file:
+                        local = alias.asname or alias.name.split(".")[-1]
+                        alias_map[local] = (src_file, None)
+
+        # Resolve attribute accesses: alias.something → symbol
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                obj = node.value.id
+                if obj in alias_map:
+                    src_file, _ = alias_map[obj]
+                    references[src_file].add(node.attr)
+
+        # Conservative fallback: alias with no attribute accesses found
+        for local, (src_file, _) in alias_map.items():
+            if src_file and src_file not in references:
+                src_path = self.repo_root / src_file
+                references[src_file].update(
+                    self._extract_public_symbols(src_path)
+                )
+
+        return dict(references)
+
+    # ─────────────────────────────────────────────
+    # PHASE 1: Build both reverse graphs
+    # ─────────────────────────────────────────────
+
+    def _build_reverse_graphs(self, module_map: dict) -> tuple:
+        """
+        Build two graphs simultaneously.
+
+        file_reverse_graph:
+            "torch/_inductor/scheduler.py" → ["test/inductor/test_scheduler.py", ...]
+
+        function_reverse_graph:
+            "torch/_inductor/scheduler.py::_fuse_nodes" → ["test/inductor/test_scheduler.py"]
+            "torch/_inductor/scheduler.py::Scheduler"   → ["test/inductor/test_scheduler.py",
+                                                            "test/inductor/test_loop_ordering.py"]
+        """
+        file_reverse     = defaultdict(set)
+        function_reverse = defaultdict(set)
+
+        for test in self.test_files:
+            rel_test   = str(test.relative_to(self.repo_root))
+            references = self._extract_symbol_references(test, module_map)
+
+            for src_file, symbols in references.items():
+                # file-level (coarse)
+                file_reverse[src_file].add(rel_test)
+
+                # function-level (precise)
+                for sym in symbols:
+                    key = f"{src_file}::{sym}"
+                    function_reverse[key].add(rel_test)
+
+        return (
+            {k: sorted(v) for k, v in file_reverse.items()},
+            {k: sorted(v) for k, v in function_reverse.items()},
+        )
+
+    # ─────────────────────────────────────────────
+    # PHASE 2: pytest --collect-only inventory
     # ─────────────────────────────────────────────
 
     def _collect_batch(self, batch: list) -> str:
-        """
-        Run pytest --collect-only on a batch of up to `batch_size` files.
-        --continue-on-collection-errors means failed imports (e.g. distributed
-        tests needing CUDA) are silently skipped — not errors.
-        """
         cmd = [
             sys.executable, "-m", "pytest",
             "--collect-only", "-q", "--no-header",
@@ -135,40 +232,24 @@ class GraphBuilder:
 
         try:
             result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=str(self.repo_root),
-                timeout=30,
+                cmd, capture_output=True, text=True,
+                cwd=str(self.repo_root), timeout=30,
             )
             return result.stdout
-        except subprocess.TimeoutExpired:
-            return ""
         except Exception:
             return ""
 
     def _build_test_inventory(self, candidate_test_files: list) -> dict:
-        """
-        Run pytest --collect-only in small batches to get actual runnable
-        test node IDs.
-
-        Batching solves:
-          1. Timeout — 1256 files at once exceeds 30s; 50 files is ~3s
-          2. Import failures — distributed tests that can't load on Mac
-             are silently skipped per-batch without aborting everything
-          3. Dynamic test generation — gets TestSchedulerCPU not TestScheduler
-        """
         if not candidate_test_files:
             return {}
 
-        batch_size = self.batch_size
-        batches    = [
-            candidate_test_files[i:i + batch_size]
-            for i in range(0, len(candidate_test_files), batch_size)
+        batches = [
+            candidate_test_files[i:i + self.batch_size]
+            for i in range(0, len(candidate_test_files), self.batch_size)
         ]
 
         print(f"    Collecting {len(candidate_test_files)} test files "
-              f"in {len(batches)} batches of {batch_size}...")
+              f"in {len(batches)} batches of {self.batch_size}...")
 
         inventory  = defaultdict(lambda: defaultdict(lambda: {"node_ids": [], "test_count": 0}))
         successful = 0
@@ -180,11 +261,8 @@ class GraphBuilder:
 
             for line in stdout.splitlines():
                 line = line.strip()
-                if "::" not in line:
+                if "::" not in line or line.startswith(("ERROR", "Warning", "FAILED")):
                     continue
-                if line.startswith(("ERROR", "Warning", "FAILED")):
-                    continue
-
                 parts = line.split("::")
                 if len(parts) < 3:
                     continue
@@ -199,11 +277,11 @@ class GraphBuilder:
                 successful += 1
 
             if (i + 1) % 5 == 0 or (i + 1) == len(batches):
-                print(f"    [{i+1}/{len(batches)} batches done] "
+                print(f"    [{i+1}/{len(batches)} batches]  "
                       f"{successful} test methods collected")
 
         if successful == 0:
-            print("    ⚠️  Collection returned no results — falling back to AST inventory")
+            print("    ⚠️  Falling back to AST inventory")
             return self._build_ast_inventory(candidate_test_files)
 
         return {
@@ -212,12 +290,7 @@ class GraphBuilder:
         }
 
     def _build_ast_inventory(self, test_files: list) -> dict:
-        """
-        Fallback AST-based inventory.
-        Less accurate for repos using dynamic test generation (e.g. PyTorch).
-        """
         inventory = {}
-
         for test_path_str in test_files:
             test_path = self.repo_root / test_path_str
             if not test_path.exists():
@@ -238,9 +311,9 @@ class GraphBuilder:
                     )
                     if is_test:
                         methods = [
-                            item.name for item in node.body
-                            if isinstance(item, ast.FunctionDef)
-                            and item.name.startswith("test_")
+                            m.name for m in node.body
+                            if isinstance(m, ast.FunctionDef)
+                            and m.name.startswith("test_")
                         ]
                         if methods:
                             classes[node.name] = {
@@ -250,7 +323,6 @@ class GraphBuilder:
                                 ],
                                 "test_count": len(methods),
                             }
-
             if classes:
                 inventory[test_path_str] = classes
 
@@ -261,7 +333,7 @@ class GraphBuilder:
     # ─────────────────────────────────────────────
 
     def build(self) -> dict:
-        print("  Phase 1: Building import graph via AST...")
+        print("  Phase 1: Building file + function graph via AST...")
         t0 = time.time()
 
         module_map = {}
@@ -270,38 +342,45 @@ class GraphBuilder:
             module_name = ".".join(rel.with_suffix("").parts)
             module_map[module_name] = str(rel)
 
-        reverse_graph = self._build_reverse_graph(module_map)
-        print(f"    Done in {time.time() - t0:.2f}s — "
-              f"{len(reverse_graph)} source files indexed")
+        file_reverse, function_reverse = self._build_reverse_graphs(module_map)
+
+        t1 = time.time() - t0
+        total_f_edges = sum(len(v) for v in file_reverse.values())
+        total_s_edges = sum(len(v) for v in function_reverse.values())
+        avg_file = total_f_edges / max(len(file_reverse), 1)
+        avg_sym  = total_s_edges / max(len(function_reverse), 1)
+
+        print(f"    Done in {t1:.2f}s")
+        print(f"    File-level graph:     {len(file_reverse)} source files  "
+              f"(avg {avg_file:.1f} test files each)")
+        print(f"    Function-level graph: {len(function_reverse)} symbols  "
+              f"(avg {avg_sym:.1f} test files each  —  "
+              f"{'%.1f' % (avg_file / max(avg_sym, 0.01))}x more precise)")
 
         print("  Phase 2: Building test inventory via pytest --collect-only...")
-        t1 = time.time()
+        t2 = time.time()
 
         all_candidate_tests = sorted(set(
-            tf for tests in reverse_graph.values() for tf in tests
+            tf for tests in file_reverse.values() for tf in tests
         ))
-
         test_inventory = self._build_test_inventory(all_candidate_tests)
-        print(f"    Done in {time.time() - t1:.2f}s — "
+
+        print(f"    Done in {time.time() - t2:.2f}s — "
               f"{len(test_inventory)} test files indexed")
 
         return {
-            "language":           self.language,
-            "full_reverse_graph": reverse_graph,
-            "test_inventory":     test_inventory,
-            "built_at":           time.time(),
+            "schema_version":         "2.0",
+            "language":               self.language,
+            "full_reverse_graph":     file_reverse,
+            "function_reverse_graph": function_reverse,
+            "test_inventory":         test_inventory,
+            "built_at":               time.time(),
         }
-
-    # ─────────────────────────────────────────────
-    # SAVE
-    # ─────────────────────────────────────────────
 
     def save(self, graph_data: dict) -> Path:
         graph_dir  = self.repo_root / ".graph" / "tselect"
         graph_dir.mkdir(parents=True, exist_ok=True)
         graph_path = graph_dir / "dependency_graph.json"
-
         with open(graph_path, "w") as f:
             json.dump(graph_data, f, indent=2)
-
         return graph_path

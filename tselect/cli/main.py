@@ -36,6 +36,7 @@ from tselect.reporting.summary import generate_summary
 from tselect.reporting.cache import load_cache, save_cache
 from tselect.adapters.baseline_detector import detect_baseline_command
 from tselect.adapters.git_adapter import get_changed_files
+from tselect.core.diff_parser import get_changed_functions
 from tselect.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -83,6 +84,78 @@ def _filter_changed_files(changed_files: list, ignore_patterns: list) -> tuple[l
             actionable.append(f)
 
     return actionable, ignored
+
+
+def _is_ai_enabled(config: dict) -> bool:
+    """AI is enabled by default (opt-out model)."""
+    return config.get("ai", {}).get("enabled", True)
+
+
+def _run_ai_prefilter(selected, changed_files, repo_root, config):
+    """
+    Run LLM pre-filter on graph-selected candidates.
+    Returns (filtered_selected, ai_decisions).
+    Falls back to original selected on any error.
+    """
+    from tselect.ai.llm_client import LLMClient, LLMClientError
+    from tselect.ai.pre_filter import PreFilter
+
+    try:
+        llm             = LLMClient(config)
+        pf              = PreFilter(llm, config)
+        changed_symbols = get_changed_functions(repo_root, changed_files)
+
+        filtered, ai_decisions = pf.filter(
+            selected        = selected,
+            changed_files   = changed_files,
+            changed_symbols = changed_symbols,
+        )
+        return filtered, ai_decisions
+
+    except LLMClientError as e:
+        print(f"\n  ⚠️  AI pre-filter unavailable: {e}")
+        print("  Proceeding with full rule-based selection.")
+        return selected, []
+
+    except Exception as e:
+        print(f"\n  ⚠️  AI pre-filter error: {e}")
+        print("  Proceeding with full rule-based selection.")
+        return selected, []
+
+
+def _run_ai_postanalysis(failed_tests, changed_files, repo_root, config,
+                          passed, failed, skipped):
+    """
+    Run LLM post-analysis on test failures.
+    Returns analysis dict or None.
+    """
+    from tselect.ai.llm_client import LLMClient, LLMClientError
+    from tselect.ai.post_analyzer import PostAnalyzer
+
+    if not failed_tests:
+        return None
+
+    try:
+        llm             = LLMClient(config)
+        analyzer        = PostAnalyzer(llm)
+        changed_symbols = get_changed_functions(repo_root, changed_files)
+
+        return analyzer.analyze(
+            failed_tests    = failed_tests,
+            changed_files   = changed_files,
+            changed_symbols = changed_symbols,
+            passed          = passed,
+            failed          = failed,
+            skipped         = skipped,
+        )
+
+    except LLMClientError as e:
+        print(f"\n  ⚠️  AI post-analysis unavailable: {e}")
+        return None
+
+    except Exception as e:
+        print(f"\n  ⚠️  AI post-analysis error: {e}")
+        return None
 
 
 def main():
@@ -176,7 +249,7 @@ def main():
         print()
         print("► Scanning repository layout...")
 
-        layout  = RepoLayoutInferer(repo_root, config).infer()
+        layout = RepoLayoutInferer(repo_root, config).infer()
 
         try:
             builder = GraphBuilder(layout)
@@ -266,6 +339,10 @@ def main():
         # ── step 3: load graph ──
         graph_loader = GraphLoader(repo_root)
 
+        # always define ai_decisions so generate_summary never fails
+        ai_decisions = []
+        ai_analysis  = None
+
         if graph_loader.exists():
             graph = graph_loader.load()
 
@@ -282,9 +359,19 @@ def main():
                 changed_files, graph, repo_root
             )
 
+            # ── AI pre-filter (runs after graph, before pytest) ──
+            if _is_ai_enabled(config):
+                selected, ai_decisions = _run_ai_prefilter(
+                    selected      = selected,
+                    changed_files = changed_files,
+                    repo_root     = repo_root,
+                    config        = config,
+                )
+
             node_ids                           = get_pytest_node_ids(selected)
             selected_classes, class_test_count = get_summary_info(selected)
 
+            # components = stem of each changed file for summary reporting
             components = sorted(set(Path(f).stem for f in changed_files))
 
             _print_section(
@@ -386,6 +473,26 @@ def main():
             else "PASSED"
         )
 
+        # ── AI post-analysis (only if tests failed) ──
+        if _is_ai_enabled(config) and failed > 0:
+            print("\n  🤖 AI analyzing failures...")
+            ai_analysis = _run_ai_postanalysis(
+                failed_tests  = [],   # TODO: parse failed node IDs from pytest output
+                changed_files = changed_files,
+                repo_root     = repo_root,
+                config        = config,
+                passed        = passed,
+                failed        = failed,
+                skipped       = skipped,
+            )
+            if ai_analysis:
+                print()
+                print(f"  Root cause : {ai_analysis.get('root_cause_file', 'unknown')}")
+                print(f"  Symbol     : {ai_analysis.get('root_cause_symbol', 'unknown')}")
+                print(f"  What broke : {ai_analysis.get('failure_pattern', '')}")
+                print(f"  Explanation: {ai_analysis.get('explanation', '')}")
+                print(f"  Suggestion : {ai_analysis.get('suggested_fix', '')}")
+
         if status == "COLLECTION_ERROR":
             print()
             print("  ❌ No tests ran — pytest encountered collection errors.")
@@ -396,15 +503,27 @@ def main():
             print("  Run: tselect build-graph")
             print()
 
+        # ── AI summary stats ──
+        ai_removed    = sum(1 for d in ai_decisions if not d["should_run"])
+        kept          = [d for d in ai_decisions if d["should_run"]]
+        ai_confidence = (
+            sum(d["confidence"] for d in kept) / len(kept)
+            if kept else None
+        )
+
         generate_summary(
-            components  = components,
-            total_tests = len(node_ids),
-            duration    = duration,
-            status      = "PASSED" if return_code == 0 else status,
-            baseline    = baseline_time,
-            passed      = passed,
-            failed      = failed,
-            skipped     = skipped,
+            components    = components,
+            total_tests   = len(node_ids),
+            duration      = duration,
+            status        = "PASSED" if return_code == 0 else status,
+            baseline      = baseline_time,
+            passed        = passed,
+            failed        = failed,
+            skipped       = skipped,
+            ai_decisions  = ai_decisions,
+            ai_removed    = ai_removed,
+            ai_confidence = ai_confidence,
+            ai_analysis   = ai_analysis,
         )
 
         # honour CI fail-on-failure setting

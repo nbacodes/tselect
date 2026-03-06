@@ -49,6 +49,13 @@ DEFAULTS = {
         "enabled":           False,
         "min_history_days":  14,
     },
+    "ai": {
+        "enabled":              True,    # opt-out model
+        "api_key":              "",
+        "model":                "llama-3.3-70b-versatile",
+        "timeout":              15,
+        "confidence_threshold": 0.75,
+    }
 }
 
 

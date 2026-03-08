@@ -60,6 +60,7 @@ def _build_changed_summary(changed_files: list, changed_symbols: dict) -> str:
     Build a concise summary of what changed, including module context.
     changed_symbols: {rel_path: set(symbol_names)} from diff_parser
     """
+
     lines = []
     for f in changed_files:
         syms  = changed_symbols.get(f, set())
@@ -78,6 +79,7 @@ def _module_description(file_path: str) -> str:
     Return a brief description of what a module does.
     LLM uses this to reason about relevance more accurately.
     """
+    
     KNOWN_MODULES = {
         "distributed":   "distributed collective communication (NCCL/Gloo ops)",
         "autograd":      "automatic differentiation engine",

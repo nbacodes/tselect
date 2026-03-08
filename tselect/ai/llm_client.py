@@ -46,6 +46,7 @@ class LLMClient:
         Send prompt to Groq, return response string.
         Raises LLMClientError on failure.
         """
+        
         try:
             response = self.client.chat.completions.create(
                 model       = self.model,

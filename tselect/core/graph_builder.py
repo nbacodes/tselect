@@ -407,6 +407,12 @@ class GraphBuilder:
             module_name = ".".join(rel.with_suffix("").parts)
             module_map[module_name] = str(rel)
 
+            # ADD: map torch.optim → torch/optim/__init__.py
+            # without this, "from torch.optim import X" never resolves
+            if src.name == "__init__.py":                          # ADD
+                package_name = ".".join(src.parent.relative_to(self.repo_root).parts)  # ADD
+                module_map[package_name] = str(rel)                # ADD
+
         # ── Phase 0: source → source reverse graph ──
         print("  Phase 0: Building source import graph (transitive deps)...")
         t0 = time.time()

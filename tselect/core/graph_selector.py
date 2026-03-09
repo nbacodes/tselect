@@ -54,20 +54,24 @@ DEFAULT_TRANSITIVE_DEPTH      = 3   # how many hops to follow in source graph
 def _expand_transitively(
     changed_file: str,
     source_reverse_graph: dict,
+    file_reverse_graph: dict,
     depth: int = DEFAULT_TRANSITIVE_DEPTH,
+    threshold: int = DEFAULT_HIGH_FANOUT_THRESHOLD,
 ) -> set:
     """
     BFS through source_reverse_graph to find all source files
     that transitively import the changed file.
 
+    Fanout guard: stops BFS at any file that has more than
+    `threshold` test dependents — these are infrastructure files
+    (torch/__init__.py, common_utils.py etc.) that import everything
+    and would cause an explosion in candidate count.
+
     Example:
         changed:  torch/optim/sgd.py
-        depth 1:  torch/optim/__init__.py        (imports sgd.py)
-        depth 2:  torch/optim/optimizer.py       (imports __init__.py)
-        result:   {sgd.py, __init__.py, optimizer.py}
-
-    All of these are now candidates for test lookup, because any test
-    that imports any of them is transitively affected by sgd.py changing.
+        depth 1:  torch/optim/__init__.py  (3 tests → safe, follow ✅)
+                  torch/__init__.py        (1075 tests → STOP 🛑)
+        result:   {sgd.py, optim/__init__.py}
     """
     visited  = {changed_file}
     frontier = {changed_file}
@@ -76,14 +80,19 @@ def _expand_transitively(
         next_frontier = set()
         for f in frontier:
             importers = set(source_reverse_graph.get(f, []))
-            new       = importers - visited
-            next_frontier |= new
-            visited       |= new
+            for importer in importers:
+                if importer in visited:
+                    continue
+                # fanout guard — stop BFS at infrastructure files
+                if len(file_reverse_graph.get(importer, [])) > threshold:
+                    continue
+                next_frontier.add(importer)
+                visited.add(importer)
         frontier = next_frontier
         if not frontier:
             break
 
-    return visited  # includes changed_file + all transitive importers
+    return visited  # includes changed_file + safe transitive importers
 
 
 def select_tests_from_graph(
@@ -141,10 +150,14 @@ def select_tests_from_graph(
         rel = _normalize(cf, repo_root)
 
         # ── transitive expansion ──
-        # Find all source files that (transitively) import this changed file.
-        # This is the key fix for the under-selection problem.
         if has_transitive:
-            expanded = _expand_transitively(rel, source_reverse_graph, trans_depth)
+            expanded = _expand_transitively(
+                changed_file         = rel,
+                source_reverse_graph = source_reverse_graph,
+                file_reverse_graph   = reverse_graph,
+                depth                = trans_depth,
+                threshold            = threshold,
+            )
         else:
             expanded = {rel}
 

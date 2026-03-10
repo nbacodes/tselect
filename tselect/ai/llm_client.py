@@ -7,7 +7,7 @@ Reads config from tselect.yaml:
     ai:
       api_key: gsk_xxxx
       model: llama-3.3-70b-versatile   # optional
-      timeout: 15                       # optional
+      timeout: 15                      # optional
 """
 
 from groq import Groq

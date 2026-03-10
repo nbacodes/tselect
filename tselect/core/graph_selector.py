@@ -48,7 +48,7 @@ from collections import defaultdict
 
 
 DEFAULT_HIGH_FANOUT_THRESHOLD = 30
-DEFAULT_TRANSITIVE_DEPTH      = 3   # how many hops to follow in source graph
+DEFAULT_TRANSITIVE_DEPTH      = 1  # how many hops to follow in source graph
 
 
 def _expand_transitively(
@@ -150,7 +150,12 @@ def select_tests_from_graph(
         rel = _normalize(cf, repo_root)
 
         # ── transitive expansion ──
-        if has_transitive:
+        # Skip for high-fanout files — already untargetable, expanding
+        # transitively just pulls in hundreds more files with zero benefit.
+        # Example: nn/functional.py (116 tests) → skip transitive
+        #          sgd.py (0 tests)              → expand transitively ✅
+        direct_count = len(reverse_graph.get(rel, []))
+        if has_transitive and direct_count <= threshold:
             expanded = _expand_transitively(
                 changed_file         = rel,
                 source_reverse_graph = source_reverse_graph,

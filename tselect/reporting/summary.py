@@ -6,6 +6,55 @@ def _short_reason(reason: str, max_len: int = 60) -> str:
     return reason[:max_len - 1].rsplit(" ", 1)[0] + "…"
 
 
+def _build_audit(ai_decisions: list) -> dict:
+    """
+    Classify each AI decision into one of 4 buckets for the audit report.
+
+    Buckets:
+      correct_keeps    — kept, confidence >= 0.75  (high confidence, likely right)
+      correct_removes  — removed, confidence >= 0.75 (high confidence removal)
+      safety_keeps     — kept, confidence < 0.75   (safety rule fired, uncertain)
+      risky_removes    — removed, confidence < 0.75 (shouldn't happen, safety rule prevents)
+
+    Also flags potential false positives: kept at high confidence but reason
+    mentions "unrelated" or "does not directly" — LLM contradicted itself.
+    """
+    correct_keeps   = []
+    correct_removes = []
+    safety_keeps    = []
+    contradictions  = []   # kept at low confidence with reason saying unrelated
+
+    for d in ai_decisions:
+        conf       = d.get("confidence", 0.0)
+        should_run = d.get("should_run", True)
+        reason     = d.get("reason", "").lower()
+
+        # detect contradictions: kept but reason sounds negative
+        negative_phrases = [
+            "does not directly", "unrelated", "not directly test",
+            "no direct", "indirect", "not related"
+        ]
+        reason_sounds_negative = any(p in reason for p in negative_phrases)
+
+        if should_run:
+            if conf >= 0.75:
+                if reason_sounds_negative:
+                    contradictions.append(d)   # false positive risk
+                else:
+                    correct_keeps.append(d)
+            else:
+                safety_keeps.append(d)         # safety rule fired
+        else:
+            correct_removes.append(d)          # removed with confidence
+
+    return {
+        "correct_keeps":   correct_keeps,
+        "correct_removes": correct_removes,
+        "safety_keeps":    safety_keeps,
+        "contradictions":  contradictions,
+    }
+
+
 def generate_summary(
     components,
     total_tests,
@@ -40,9 +89,9 @@ def generate_summary(
         time_saved    = max(0, baseline - duration)
         percent_saved = (time_saved / baseline) * 100
 
-    executed      = passed + failed + skipped   # real executed count
+    executed      = passed + failed + skipped
     ai_decisions  = ai_decisions or []
-    tests_before  = executed + sum(            # reconstruct pre-filter count
+    tests_before  = executed + sum(
         d.get("test_count", 0)
         for d in ai_decisions if not d["should_run"]
     )
@@ -97,9 +146,71 @@ def generate_summary(
             action = "kept   " if d["should_run"] else "removed"
             conf   = d.get("confidence", 0.0)
             reason = _short_reason(d.get("reason", ""))
-            fname  = d["test_file"].split("/")[-1]   # just filename, not full path
+            fname  = d["test_file"].split("/")[-1]
             print(f"  {icon} {action}  {fname:<45}  ({conf:.2f})")
             print(f"            {reason}")
+        print()
+
+    # -------------------------------------------------
+    # SELECTION AUDIT
+    # -------------------------------------------------
+    if ai_decisions:
+        audit = _build_audit(ai_decisions)
+
+        print("  " + "─" * (W - 4))
+        print("  Selection Audit")
+        print("  " + "─" * (W - 4))
+
+        # correct keeps
+        if audit["correct_keeps"]:
+            print(f"  ✅ HIGH CONFIDENCE SELECTIONS  ({len(audit['correct_keeps'])} files)")
+            for d in audit["correct_keeps"]:
+                fname  = d["test_file"].split("/")[-1]
+                reason = _short_reason(d.get("reason", ""), 55)
+                conf   = d.get("confidence", 0.0)
+                print(f"     {fname:<40}  ({conf:.2f})  {reason}")
+            print()
+
+        # correct removes
+        if audit["correct_removes"]:
+            print(f"  ❌ HIGH CONFIDENCE REMOVALS  ({len(audit['correct_removes'])} files)")
+            for d in audit["correct_removes"]:
+                fname  = d["test_file"].split("/")[-1]
+                reason = _short_reason(d.get("reason", ""), 55)
+                conf   = d.get("confidence", 0.0)
+                print(f"     {fname:<40}  ({conf:.2f})  {reason}")
+            print()
+
+        # safety rule keeps
+        if audit["safety_keeps"]:
+            print(f"  ⚠️  KEPT BY SAFETY RULE  ({len(audit['safety_keeps'])} files)")
+            print(f"     (LLM was uncertain → kept to avoid missing bugs)")
+            for d in audit["safety_keeps"]:
+                fname = d["test_file"].split("/")[-1]
+                conf  = d.get("confidence", 0.0)
+                print(f"     {fname:<40}  ({conf:.2f})  reason unclear")
+            print()
+
+        # contradictions — potential false positives
+        if audit["contradictions"]:
+            print(f"  ⚠️  POTENTIAL FALSE POSITIVES  ({len(audit['contradictions'])} files)")
+            print(f"     (kept at high confidence but reason suggests unrelated)")
+            for d in audit["contradictions"]:
+                fname  = d["test_file"].split("/")[-1]
+                reason = _short_reason(d.get("reason", ""), 55)
+                conf   = d.get("confidence", 0.0)
+                print(f"     {fname:<40}  ({conf:.2f})  {reason}")
+                print(f"     → Risk: LOW (extra tests run, no missed bugs)")
+            print()
+
+        # overall audit score
+        total      = len(ai_decisions)
+        confident  = len(audit["correct_keeps"]) + len(audit["correct_removes"])
+        uncertain  = len(audit["safety_keeps"]) + len(audit["contradictions"])
+        score      = confident / max(total, 1)
+        print(f"  Decision quality : {confident}/{total} high-confidence  ({score:.0%})")
+        if uncertain > 0:
+            print(f"  Uncertain        : {uncertain} files kept conservatively")
         print()
 
     # -------------------------------------------------

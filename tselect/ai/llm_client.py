@@ -7,7 +7,7 @@ Reads config from tselect.yaml:
     ai:
       api_key: gsk_xxxx
       model: llama-3.3-70b-versatile   # optional
-      timeout: 15                       # optional
+      timeout: 15                      # optional
 """
 
 from groq import Groq
@@ -46,6 +46,7 @@ class LLMClient:
         Send prompt to Groq, return response string.
         Raises LLMClientError on failure.
         """
+        
         try:
             response = self.client.chat.completions.create(
                 model       = self.model,

@@ -3,8 +3,12 @@ graph_builder.py
 ----------------
 Builds the dependency graph for tselect.
 
-Two-phase build:
-  Phase 1: AST parsing → TWO reverse graphs:
+Three-phase build:
+  Phase 0: AST parsing of SOURCE files → source_reverse_graph
+             source_file → [source files that import it]
+             Enables transitive dependency resolution.
+
+  Phase 1: AST parsing of TEST files → TWO reverse graphs:
              (a) file_reverse_graph:     source file  → test files that import it
              (b) function_reverse_graph: source symbol → test files that reference it
 
@@ -12,6 +16,10 @@ Two-phase build:
 
 The function_reverse_graph enables function-level selection:
   "_fuse_nodes() changed" → 2 test files  (instead of all 7 that import scheduler.py)
+
+The source_reverse_graph enables transitive selection:
+  "sgd.py changed" → optim/__init__.py imports it → test_optim.py imports __init__
+  → test_optim.py selected even though it never directly imports sgd.py
 
 How function references are detected — three import patterns:
 
@@ -99,6 +107,65 @@ class GraphBuilder:
                         symbols.add(target.id)
 
         return symbols
+
+    # ─────────────────────────────────────────────
+    # PHASE 0: Source → Source reverse graph
+    # ─────────────────────────────────────────────
+
+    def _build_source_reverse_graph(self, module_map: dict) -> dict:
+        """
+        Parse all SOURCE files and build a reverse import graph:
+            source_file → [source files that import it]
+
+        Example:
+            torch/optim/sgd.py → [torch/optim/__init__.py, torch/optim/optimizer.py]
+
+        This enables BFS transitive expansion in graph_selector:
+            sgd.py changed
+                → __init__.py imports sgd.py
+                    → test_optim.py imports __init__.py
+                        → test_optim.py selected ✅
+        """
+        # forward: src_file → set of src_files it imports
+        forward = defaultdict(set)
+
+        for src in self.source_files:
+            rel = str(src.relative_to(self.repo_root))
+
+            try:
+                source = src.read_text(encoding="utf-8", errors="ignore")
+                tree   = ast.parse(source)
+            except Exception:
+                continue
+
+            for node in ast.walk(tree):
+                # from module import name
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    imported = module_map.get(node.module)
+                    if imported and imported != rel:
+                        forward[rel].add(imported)
+
+                    # also: from torch.optim import sgd  (submodule import)
+                    for alias in node.names:
+                        child_mod = f"{node.module}.{alias.name}"
+                        child_src = module_map.get(child_mod)
+                        if child_src and child_src != rel:
+                            forward[rel].add(child_src)
+
+                # import module
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imported = module_map.get(alias.name)
+                        if imported and imported != rel:
+                            forward[rel].add(imported)
+
+        # reverse: src_file → [src_files that import IT]
+        reverse = defaultdict(set)
+        for importer, importees in forward.items():
+            for importee in importees:
+                reverse[importee].add(importer)
+
+        return {k: sorted(v) for k, v in reverse.items()}
 
     # ─────────────────────────────────────────────
     # TEST: extract symbol-level references
@@ -333,30 +400,45 @@ class GraphBuilder:
     # ─────────────────────────────────────────────
 
     def build(self) -> dict:
-        print("  Phase 1: Building file + function graph via AST...")
-        t0 = time.time()
-
+        # ── build module map (shared across all phases) ──
         module_map = {}
         for src in self.source_files:
             rel         = src.relative_to(self.repo_root)
             module_name = ".".join(rel.with_suffix("").parts)
             module_map[module_name] = str(rel)
 
+            # ADD: map torch.optim → torch/optim/__init__.py
+            # without this, "from torch.optim import X" never resolves
+            if src.name == "__init__.py":                          # ADD
+                package_name = ".".join(src.parent.relative_to(self.repo_root).parts)  # ADD
+                module_map[package_name] = str(rel)                # ADD
+
+        # ── Phase 0: source → source reverse graph ──
+        print("  Phase 0: Building source import graph (transitive deps)...")
+        t0 = time.time()
+        source_reverse_graph = self._build_source_reverse_graph(module_map)
+        print(f"    Done in {time.time() - t0:.2f}s  —  "
+              f"{len(source_reverse_graph)} source files have dependents")
+
+        # ── Phase 1: test → source reverse graphs ──
+        print("  Phase 1: Building file + function graph via AST...")
+        t1 = time.time()
         file_reverse, function_reverse = self._build_reverse_graphs(module_map)
 
-        t1 = time.time() - t0
+        elapsed1      = time.time() - t1
         total_f_edges = sum(len(v) for v in file_reverse.values())
         total_s_edges = sum(len(v) for v in function_reverse.values())
-        avg_file = total_f_edges / max(len(file_reverse), 1)
-        avg_sym  = total_s_edges / max(len(function_reverse), 1)
+        avg_file      = total_f_edges / max(len(file_reverse), 1)
+        avg_sym       = total_s_edges / max(len(function_reverse), 1)
 
-        print(f"    Done in {t1:.2f}s")
+        print(f"    Done in {elapsed1:.2f}s")
         print(f"    File-level graph:     {len(file_reverse)} source files  "
               f"(avg {avg_file:.1f} test files each)")
         print(f"    Function-level graph: {len(function_reverse)} symbols  "
               f"(avg {avg_sym:.1f} test files each  —  "
               f"{'%.1f' % (avg_file / max(avg_sym, 0.01))}x more precise)")
 
+        # ── Phase 2: test inventory ──
         print("  Phase 2: Building test inventory via pytest --collect-only...")
         t2 = time.time()
 
@@ -369,8 +451,9 @@ class GraphBuilder:
               f"{len(test_inventory)} test files indexed")
 
         return {
-            "schema_version":         "2.0",
+            "schema_version":         "2.1",
             "language":               self.language,
+            "source_reverse_graph":   source_reverse_graph,   # NEW in 2.1
             "full_reverse_graph":     file_reverse,
             "function_reverse_graph": function_reverse,
             "test_inventory":         test_inventory,

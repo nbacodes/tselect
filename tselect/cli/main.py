@@ -109,6 +109,7 @@ def _run_ai_prefilter(selected, changed_files, repo_root, config):
             selected        = selected,
             changed_files   = changed_files,
             changed_symbols = changed_symbols,
+            repo_root       = repo_root,
         )
         return filtered, ai_decisions
 

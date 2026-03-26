@@ -3,7 +3,7 @@ import subprocess
 def get_changed_files():
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
+            ["git", "show", "--name-only", "--format=", "HEAD"],
             capture_output=True,
             text=True,
             check=True,

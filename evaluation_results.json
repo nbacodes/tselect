@@ -1,0 +1,72 @@
+[
+  {
+    "pr": 178239,
+    "conditions": {
+      "current (fanout=30, depth=1)": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      },
+      "fanout=50, depth=1": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      },
+      "fanout=116, depth=1": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      },
+      "fanout=30, depth=2": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      },
+      "fanout=30, depth=unlimited": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      }
+    }
+  },
+  {
+    "pr": 178199,
+    "conditions": {
+      "current (fanout=30, depth=1)": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      },
+      "fanout=50, depth=1": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      },
+      "fanout=116, depth=1": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      },
+      "fanout=30, depth=2": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      },
+      "fanout=30, depth=unlimited": {
+        "selected": 0,
+        "overlap_pct": 0.0,
+        "only_ours": 0,
+        "only_baseline": 874
+      }
+    }
+  }
+]

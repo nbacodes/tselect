@@ -3,44 +3,39 @@ graph_selector.py
 -----------------
 Selects tests for changed files using the dependency graph.
 
-Two-tier selection strategy:
+Selection strategy (in priority order):
+
+  0. Pre-flight checks:
+       - Test file changed (.py) → self-select directly, skip graph
+       - Non-code file changed → skip entirely
+       - Non-.py file inside test/ → skip (pallas_expected_failures etc.)
 
   Tier 1 — Function-level (precise):
     Uses diff_parser to find which functions/classes changed.
     Looks them up in function_reverse_graph.
-    Result: only tests that reference those specific symbols.
+    Result: only test METHODS that reference those specific symbols.
 
-    Example:
-      scheduler.py::_fuse_nodes changed
-      function_reverse_graph["scheduler.py::_fuse_nodes"] = [test_scheduler.py]
-      → run test_scheduler.py only  (not all 7 files that import scheduler.py)
+    Method key fix (1a):
+      diff_parser returns "SGD.step" (method inside class)
+      graph stores "SGD" (class level)
+      fix: if "SGD.step" not found → strip method → try "SGD"
+
+  Tier 1b — Re-export routing:
+    For transitive files that are DIRECT importers of the changed file,
+    use the importer's function_reverse_graph entries with the changed
+    symbols from the original file.
 
   Tier 2 — File-level fallback:
-    Used when:
-      (a) function_reverse_graph not in graph (old schema_version)
-      (b) diff_parser couldn't extract function names
-      (c) function-level lookup returns empty (new function, no tests yet)
+    Used when function-level lookup returns empty.
 
-  Transitive expansion (NEW in schema 2.1):
-    Before any lookup, changed files are expanded through source_reverse_graph.
-    Example:
-      sgd.py changed
-        → source_reverse_graph["sgd.py"] = [optim/__init__.py]
-        → expanded = {sgd.py, optim/__init__.py}
-        → file_reverse_graph["optim/__init__.py"] = [test_optim.py]
-        → test_optim.py selected ✅
-
-  High-fanout guard:
-    Infrastructure files (config.py, utils.py) trigger 100+ test files.
-    These are treated separately — configurable threshold in tselect.yaml.
-    Default: >30 test files = high-fanout = warn + skip targeted selection.
-
-Selection metadata:
-    Every selected test records WHY it was selected:
-      - selection_mode: "function" | "file" | "proximity"
-      - triggered_by:   which source file caused this
-      - matched_symbols: which functions matched (function mode only)
-    This metadata is the foundation for ML training data.
+  Transitive expansion (schema 3.0):
+    BFS through source_reverse_graph.
+    TWO stopping conditions (both must pass to follow an importer):
+      1. Fanout guard: len(test_dependents) <= fanout_threshold
+         threshold from graph (dynamic, computed from distribution gap)
+      2. Identifier overlap: importer uses at least one changed symbol
+         if changed_symbols ∩ file_identifiers[importer] == empty → stop
+    No depth counter — BFS runs until both guards stop everything.
 """
 
 from pathlib import Path
@@ -48,51 +43,117 @@ from collections import defaultdict
 
 
 DEFAULT_HIGH_FANOUT_THRESHOLD = 30
-DEFAULT_TRANSITIVE_DEPTH      = 1  # how many hops to follow in source graph
+
+NON_CODE_EXTENSIONS = {
+    '.yml', '.yaml', '.rst', '.md', '.txt',
+    '.json', '.cfg', '.ini', '.toml', '.csv',
+    '.png', '.jpg', '.jpeg', '.gif', '.svg',
+    '.sh', '.bash', '.bat', '.ps1',
+}
+NON_CODE_FILENAMES = {
+    'setup.py', 'setup.cfg', 'MANIFEST.in',
+    'Makefile', 'CMakeLists.txt', 'LICENSE', 'NOTICE',
+}
+
+TEST_PATH_PREFIXES = ('test/', 'tests/', 'test\\', 'tests\\')
+
+
+def _is_test_file(rel: str) -> bool:
+    """
+    Return True if this file is a runnable test file.
+    Must start with test/ AND be a .py file.
+    Files without .py inside test/ are data files
+    (pallas_expected_failures/*, dynamo_expected_failures/*, etc.)
+    """
+    if not rel.startswith(TEST_PATH_PREFIXES):
+        return False
+    return Path(rel).suffix == '.py'
+
+
+def _is_non_code_file(rel: str) -> bool:
+    """Return True if this file is non-code and needs no test selection."""
+    p = Path(rel)
+    # files inside test/ that are not .py are data files
+    if rel.startswith(TEST_PATH_PREFIXES) and p.suffix != '.py':
+        return True
+    return (
+        p.suffix in NON_CODE_EXTENSIONS
+        or p.name in NON_CODE_FILENAMES
+        or not p.suffix
+    )
 
 
 def _expand_transitively(
     changed_file: str,
     source_reverse_graph: dict,
     file_reverse_graph: dict,
-    depth: int = DEFAULT_TRANSITIVE_DEPTH,
+    file_identifiers: dict,
+    changed_symbols: set,
     threshold: int = DEFAULT_HIGH_FANOUT_THRESHOLD,
 ) -> set:
     """
-    BFS through source_reverse_graph to find all source files
-    that transitively import the changed file.
+    BFS through source_reverse_graph.
 
-    Fanout guard: stops BFS at any file that has more than
-    `threshold` test dependents — these are infrastructure files
-    (torch/__init__.py, common_utils.py etc.) that import everything
-    and would cause an explosion in candidate count.
+    TWO stopping conditions per importer — both must pass to follow:
+      1. Fanout guard: importer has <= threshold test dependents
+      2. Identifier overlap: importer uses at least one changed symbol
+         (only applied when changed_symbols is non-empty and meaningful)
+
+    No depth counter. BFS runs until guards stop everything.
 
     Example:
-        changed:  torch/optim/sgd.py
-        depth 1:  torch/optim/__init__.py  (3 tests → safe, follow ✅)
-                  torch/__init__.py        (1075 tests → STOP 🛑)
-        result:   {sgd.py, optim/__init__.py}
+        changed: sgd.py, symbols: {SGD, step}
+
+        torch/optim/__init__.py:
+            fanout=22 <= threshold ✅
+            identifiers include "SGD" ✅
+            → follow
+
+        torch/_dynamo/eval_frame.py:
+            fanout=89 <= threshold ✅
+            identifiers do NOT include "SGD" or "step" ❌
+            → STOP — unrelated file
+
+        torch/__init__.py:
+            fanout=1107 > threshold ❌
+            → STOP — infrastructure
     """
     visited  = {changed_file}
     frontier = {changed_file}
 
-    for _ in range(depth):
+    # normalize changed symbols for overlap check
+    # strip method suffix: "SGD.step" → "SGD", keep "__module__" out
+    base_symbols = set()
+    for s in changed_symbols:
+        if s not in ("__module__", "__imports__", "__all__", "__constant__"):
+            base_symbols.add(s.split(".")[0])
+
+    use_identifier_overlap = bool(base_symbols) and bool(file_identifiers)
+
+    while frontier:
         next_frontier = set()
         for f in frontier:
             importers = set(source_reverse_graph.get(f, []))
             for importer in importers:
                 if importer in visited:
                     continue
-                # fanout guard — stop BFS at infrastructure files
+
+                # Guard 1: fanout
                 if len(file_reverse_graph.get(importer, [])) > threshold:
                     continue
+
+                # Guard 2: identifier overlap
+                if use_identifier_overlap:
+                    importer_ids = set(file_identifiers.get(importer, []))
+                    if importer_ids and not (base_symbols & importer_ids):
+                        continue   # importer doesn't use anything that changed
+
                 next_frontier.add(importer)
                 visited.add(importer)
-        frontier = next_frontier
-        if not frontier:
-            break
 
-    return visited  # includes changed_file + safe transitive importers
+        frontier = next_frontier
+
+    return visited
 
 
 def select_tests_from_graph(
@@ -100,41 +161,29 @@ def select_tests_from_graph(
     graph: dict,
     repo_root: Path,
     config: dict = None,
-) -> tuple[dict, int]:
+) -> tuple:
     """
     Main entry point. Returns (selected, total_methods).
-
-    selected = {
-        "test/inductor/test_scheduler.py": {
-            "triggered_by": ["torch/_inductor/scheduler.py"],
-            "matched_symbols": ["_fuse_nodes", "Scheduler"],
-            "selection_mode": "function",
-            "classes": {
-                "TestSchedulerCPU": {
-                    "node_ids": [...],
-                    "test_count": 8
-                }
-            }
-        }
-    }
     """
     config    = config or {}
+
+    # use dynamic threshold from graph if available, else config, else default
     threshold = (
-        config.get("graph", {}).get("fanout_threshold", DEFAULT_HIGH_FANOUT_THRESHOLD)
+        graph.get("fanout_threshold")
+        or config.get("graph", {}).get("fanout_threshold", DEFAULT_HIGH_FANOUT_THRESHOLD)
+        or DEFAULT_HIGH_FANOUT_THRESHOLD
     )
-    trans_depth = config.get("graph", {}).get("transitive_depth", DEFAULT_TRANSITIVE_DEPTH)
 
     reverse_graph        = graph.get("full_reverse_graph", {})
     function_graph       = graph.get("function_reverse_graph", {})
     test_inventory       = graph.get("test_inventory", {})
-    source_reverse_graph = graph.get("source_reverse_graph", {})   # NEW
+    source_reverse_graph = graph.get("source_reverse_graph", {})
+    file_identifiers     = graph.get("file_identifiers", {})   # NEW
     has_function_graph   = bool(function_graph)
     has_transitive       = bool(source_reverse_graph)
 
-    # import here to avoid circular imports
     from tselect.core.diff_parser import get_changed_functions
 
-    # get function-level diff info for each changed file
     changed_functions = {}
     if has_function_graph:
         try:
@@ -142,26 +191,68 @@ def select_tests_from_graph(
         except Exception:
             changed_functions = {}
 
-    # ── selection ──────────────────────────────────
     selected_tests      = {}
     skipped_high_fanout = []
+    skipped_non_code    = []
 
     for cf in changed_files:
         rel = _normalize(cf, repo_root)
 
-        # ── transitive expansion ──
-        # Skip for high-fanout files — already untargetable, expanding
-        # transitively just pulls in hundreds more files with zero benefit.
-        # Example: nn/functional.py (116 tests) → skip transitive
-        #          sgd.py (0 tests)              → expand transitively ✅
-        direct_count = len(reverse_graph.get(rel, []))
-        if has_transitive and direct_count <= threshold:
+        # ✅ NEW: skip propagation from test files
+        if rel.startswith(TEST_PATH_PREFIXES):
+            # still allow self-select (already handled below),
+            # but DO NOT propagate further
+            pass
+
+        # Pre-flight 1: test file self-select
+        if _is_test_file(rel):
+            classes = test_inventory.get(rel, {})
+            if classes:
+                if rel not in selected_tests:
+                    selected_tests[rel] = {
+                        "triggered_by":    [rel],
+                        "matched_symbols": [],
+                        "selection_mode":  "self",
+                        "classes":         dict(classes),
+                    }
+                print(f"    Self-select: {rel} (test file changed directly)")
+            else:
+                print(f"    Self-select: {rel} (test file changed, not in inventory)")
+            continue
+
+        # Pre-flight 2: non-code file skip
+        if _is_non_code_file(rel):
+            skipped_non_code.append(rel)
+            continue
+
+        # Get changed symbols for this file — used for BFS + selection
+        rel_symbols_changed = changed_functions.get(rel, set())
+
+        # Transitive expansion with identifier overlap stopping condition
+        # ✅ FIRST try function-level on original file
+        symbols_changed = rel_symbols_changed
+
+        if has_function_graph and symbols_changed not in (set(), {"__unknown__"}):
+            function_selected = _function_level_select(
+                rel, symbols_changed, function_graph, test_inventory
+            )
+            if function_selected:
+                _merge_into_selected(selected_tests, function_selected)
+                print(f"    Function-level hit: {rel} → skipping transitive expansion")
+                continue  # 🚨 CRITICAL: stop here
+
+        elif symbols_changed in (set(), {"__unknown__"}):
+            print(f"[WARN] No usable diff symbols for {rel} → skipping function-level")
+
+        # ⚠️ Only fallback case reaches here
+        if has_transitive:
             expanded = _expand_transitively(
-                changed_file         = rel,
-                source_reverse_graph = source_reverse_graph,
-                file_reverse_graph   = reverse_graph,
-                depth                = trans_depth,
-                threshold            = threshold,
+                changed_file=rel,
+                source_reverse_graph=source_reverse_graph,
+                file_reverse_graph=reverse_graph,
+                file_identifiers=file_identifiers,
+                changed_symbols=rel_symbols_changed,
+                threshold=threshold,
             )
         else:
             expanded = {rel}
@@ -170,101 +261,114 @@ def select_tests_from_graph(
         if transitive_added:
             print(f"    Transitive: {rel} → also checking {len(transitive_added)} dependent source files")
 
-        # ── process each file in the expanded set ──
+        direct_importers_of_rel = set(source_reverse_graph.get(rel, []))
+
         for expanded_file in expanded:
 
-            # ── high-fanout check ──
             file_level_tests = set(reverse_graph.get(expanded_file, []))
             if len(file_level_tests) > threshold:
-                # only warn for the directly changed file, not transitive ones
                 if expanded_file == rel:
                     skipped_high_fanout.append((rel, len(file_level_tests)))
                 continue
 
-            # ── Tier 1: function-level selection ──
-            # Only apply function-level for the DIRECTLY changed file
-            # (we know exactly which symbols changed there).
-            # For transitive files, use file-level (we don't know which symbols
-            # were affected by the upstream change).
-            symbols_changed = changed_functions.get(expanded_file, set()) if expanded_file == rel else set()
+            # DIRECTLY CHANGED FILE
+            if expanded_file == rel:
+                symbols_changed = rel_symbols_changed
 
-            if has_function_graph and symbols_changed and expanded_file == rel:
-                function_selected = _function_level_select(
-                    expanded_file, symbols_changed, function_graph, test_inventory
+                # ✅ STRICT function-level priority
+                if has_function_graph:
+                    if symbols_changed not in (set(), {"__unknown__"}):
+                        function_selected = _function_level_select(
+                            expanded_file, symbols_changed, function_graph, test_inventory
+                        )
+                        if function_selected:
+                            _merge_into_selected(selected_tests, function_selected)
+                            continue
+
+                    elif symbols_changed == {"__unknown__"}:
+                        print(f"[WARN] Low confidence diff for {rel} → shallow fallback")
+                        # allow fallback but DO NOT expand aggressively
+
+                    else:
+                        print(f"[WARN] No usable diff info for {rel} → skipping")
+                        continue
+
+                if not file_level_tests:
+                    dir_mapping      = config.get("graph", {}).get("directory_mapping", [])
+                    file_level_tests = _proximity_fallback(expanded_file, test_inventory, dir_mapping)
+                    mode             = "proximity"
+                else:
+                    # ✅ ONLY allow file-level fallback for original file (not transitive explosion)
+                    if expanded_file != rel:
+                        continue
+                    mode = "file"
+
+                _add_file_level_tests(
+                    selected_tests, file_level_tests, test_inventory,
+                    trigger=rel, mode=mode
                 )
 
-                if function_selected:
-                    for test_file, data in function_selected.items():
-                        if test_file not in selected_tests:
-                            selected_tests[test_file] = data
-                        else:
-                            selected_tests[test_file]["triggered_by"] = sorted(set(
-                                selected_tests[test_file]["triggered_by"] + data["triggered_by"]
-                            ))
-                            selected_tests[test_file]["matched_symbols"] = sorted(set(
-                                selected_tests[test_file]["matched_symbols"] + data["matched_symbols"]
-                            ))
-                            selected_tests[test_file]["classes"].update(data["classes"])
-                    continue  # function-level succeeded
-
-            # ── Tier 2: file-level fallback ──
-            if not file_level_tests:
-                dir_mapping      = config.get("graph", {}).get("directory_mapping", [])
-                file_level_tests = _proximity_fallback(expanded_file, test_inventory, dir_mapping)
-                mode             = "proximity"
+            # TRANSITIVE FILE
             else:
-                mode = "file"
+                if has_function_graph and expanded_file in direct_importers_of_rel and rel_symbols_changed:
+                    reexport_selected = _reexport_level_select(
+                        importer_file    = expanded_file,
+                        rel_symbols      = rel_symbols_changed,
+                        original_trigger = rel,
+                        function_graph   = function_graph,
+                        test_inventory   = test_inventory,
+                    )
+                    if reexport_selected:
+                        _merge_into_selected(selected_tests, reexport_selected)
+                        continue
 
-            for test_file in file_level_tests:
-                classes = test_inventory.get(test_file, {})
-                if not classes:
-                    continue
-
-                # triggered_by = the ORIGINAL changed file (not the transitive intermediary)
-                trigger = rel
-
-                if test_file not in selected_tests:
-                    selected_tests[test_file] = {
-                        "triggered_by":    [trigger],
-                        "matched_symbols": [],
-                        "selection_mode":  mode,
-                        "classes":         dict(classes),
-                    }
+                if not file_level_tests:
+                    dir_mapping      = config.get("graph", {}).get("directory_mapping", [])
+                    file_level_tests = _proximity_fallback(expanded_file, test_inventory, dir_mapping)
+                    mode             = "proximity"
                 else:
-                    if trigger not in selected_tests[test_file]["triggered_by"]:
-                        selected_tests[test_file]["triggered_by"].append(trigger)
+                    mode = "file"
 
-    # ── warn about high-fanout files ──
+                _add_file_level_tests(
+                    selected_tests, file_level_tests, test_inventory,
+                    trigger=rel, mode=mode
+                )
+
+    if skipped_non_code:
+        print()
+        for f in skipped_non_code:
+            print(f"    Skipping non-code file: {f}")
+
     if skipped_high_fanout:
         print()
         print("    High-fanout files skipped (infrastructure files):")
         for f, count in skipped_high_fanout:
             print(f"     {f}  ({count} test files depend on it)")
         print()
-        print("  These files are imported everywhere — targeted selection not meaningful.")
-        print("  Run the full suite manually for these changes:")
-        print("    pytest test/inductor/")
-        print()
 
-    # ── compute total methods ──
     total_methods = sum(
         cls_data["test_count"]
         for data in selected_tests.values()
         for cls_data in data["classes"].values()
     )
 
-    # ── print selection mode summary ──
-    function_mode_count = sum(
-        1 for d in selected_tests.values() if d.get("selection_mode") == "function"
-    )
-    file_mode_count = len(selected_tests) - function_mode_count
+    mode_counts = defaultdict(int)
+    for d in selected_tests.values():
+        mode_counts[d.get("selection_mode", "unknown")] += 1
+
     if selected_tests:
-        print(f"  Selection mode: "
-              f"{function_mode_count} test files via function-level  |  "
-              f"{file_mode_count} via file-level fallback")
+        mode_str = "  |  ".join(
+            f"{count} via {mode}"
+            for mode, count in sorted(mode_counts.items())
+        )
+        print(f"  Selection mode: {mode_str}")
 
     return selected_tests, total_methods
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Selection helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _function_level_select(
     src_file: str,
@@ -274,7 +378,17 @@ def _function_level_select(
 ) -> dict:
     """
     Look up changed symbols in function_reverse_graph.
-    Returns selected test files with which symbols matched.
+
+    Schema 3.0: function_graph values are test METHOD IDs:
+        "test_optim.py::TestOptimCPU::test_sgd_momentum"
+
+    Schema 2.x: function_graph values are test FILE paths:
+        "test_optim.py"
+
+    Handles both — detects by checking if value contains "::" (method ID)
+    or not (file path).
+
+    1a method key fix: SGD.step → try SGD if SGD.step not found.
     """
     if "__module__" in symbols_changed:
         all_symbols = {
@@ -284,21 +398,166 @@ def _function_level_select(
         }
         symbols_changed = all_symbols or symbols_changed
 
-    selected  = defaultdict(lambda: {"triggered_by": [], "matched_symbols": [], "selection_mode": "function", "classes": {}})
+    selected  = defaultdict(lambda: {
+        "triggered_by":    [],
+        "matched_symbols": [],
+        "selection_mode":  "function",
+        "classes":         {},
+    })
     found_any = False
 
     for sym in symbols_changed:
         key        = f"{src_file}::{sym}"
-        test_files = function_graph.get(key, [])
+        graph_vals = function_graph.get(key, [])
 
-        for test_file in test_files:
-            classes = test_inventory.get(test_file, {})
-            if not classes:
-                continue
-            found_any = True
-            selected[test_file]["triggered_by"]    = [src_file]
-            selected[test_file]["matched_symbols"].append(sym)
-            selected[test_file]["classes"].update(classes)
+        # 1a: method key fix
+        effective_sym = sym
+        if not graph_vals and "." in sym:
+            class_name = sym.split(".")[0]
+            class_key  = f"{src_file}::{class_name}"
+            graph_vals = function_graph.get(class_key, [])
+            if graph_vals:
+                effective_sym = class_name
+
+        for val in graph_vals:
+            # schema 3.0: val = "test_file.py::ClassName::test_method"
+            if val.count("::") >= 2:
+                parts     = val.split("::")
+                test_file = parts[0]
+                cls_name  = parts[1]
+                method    = parts[2]
+                node_id   = val
+
+                classes = test_inventory.get(test_file, {})
+                if not classes and cls_name not in (classes or {}):
+                    # method not in inventory — add with single method
+                    if test_file not in selected:
+                        selected[test_file]["triggered_by"]    = [src_file]
+                        selected[test_file]["matched_symbols"].append(effective_sym)
+                    selected[test_file]["classes"][cls_name] = {
+                        "node_ids":   [node_id],
+                        "test_count": 1,
+                    }
+                else:
+                    # add only this specific method from inventory
+                    if test_file not in selected:
+                        selected[test_file]["triggered_by"]    = [src_file]
+                        selected[test_file]["matched_symbols"].append(effective_sym)
+                    if cls_name in (classes or {}):
+                        # use full class from inventory (preserves all node_ids)
+                        selected[test_file]["classes"][cls_name] = classes[cls_name]
+                    else:
+                        selected[test_file]["classes"][cls_name] = {
+                            "node_ids":   [node_id],
+                            "test_count": 1,
+                        }
+                found_any = True
+
+            # schema 2.x: val = "test_file.py" (fallback)
+            else:
+                test_file = val
+                classes   = test_inventory.get(test_file, {})
+                if not classes:
+                    continue
+                found_any = True
+                selected[test_file]["triggered_by"]    = [src_file]
+                selected[test_file]["matched_symbols"].append(effective_sym)
+                selected[test_file]["classes"].update(classes)
+
+    if not found_any:
+        # 🔥 NEW: fallback to module-level if symbols not found in graph
+        print(f"[WARN] No graph match for symbols in {src_file} → falling back to module-level")
+
+        # collect all symbols from this file
+        module_symbols = {
+            key.split("::", 1)[1]
+            for key in function_graph
+            if key.startswith(f"{src_file}::")
+        }
+
+        if module_symbols:
+            return _function_level_select(
+                src_file,
+                module_symbols,
+                function_graph,
+                test_inventory,
+            )
+
+        return {}
+
+    for data in selected.values():
+        data["matched_symbols"] = sorted(set(data["matched_symbols"]))
+
+    return dict(selected)
+
+
+def _reexport_level_select(
+    importer_file: str,
+    rel_symbols: set,
+    original_trigger: str,
+    function_graph: dict,
+    test_inventory: dict,
+) -> dict:
+    """
+    Re-export routing: use importer's function_graph with changed symbols.
+    Handles both schema 3.0 (method IDs) and 2.x (file paths).
+    """
+    normalized_symbols = set()
+    for sym in rel_symbols:
+        if sym == "__module__":
+            all_importer_syms = {
+                key.split("::", 1)[1]
+                for key in function_graph
+                if key.startswith(f"{importer_file}::")
+            }
+            normalized_symbols.update(all_importer_syms)
+        elif "." in sym:
+            normalized_symbols.add(sym.split(".")[0])
+        else:
+            normalized_symbols.add(sym)
+
+    if not normalized_symbols:
+        return {}
+
+    selected  = defaultdict(lambda: {
+        "triggered_by":    [],
+        "matched_symbols": [],
+        "selection_mode":  "re-export",
+        "classes":         {},
+    })
+    found_any = False
+
+    for sym in normalized_symbols:
+        key        = f"{importer_file}::{sym}"
+        graph_vals = function_graph.get(key, [])
+
+        for val in graph_vals:
+            if val.count("::") >= 2:
+                parts     = val.split("::")
+                test_file = parts[0]
+                cls_name  = parts[1]
+                node_id   = val
+                classes   = test_inventory.get(test_file, {})
+
+                selected[test_file]["triggered_by"]    = [original_trigger]
+                selected[test_file]["matched_symbols"].append(sym)
+                if cls_name in (classes or {}):
+                    selected[test_file]["classes"][cls_name] = classes[cls_name]
+                else:
+                    selected[test_file]["classes"][cls_name] = {
+                        "node_ids":   [node_id],
+                        "test_count": 1,
+                    }
+                found_any = True
+            else:
+                test_file = val
+                classes   = test_inventory.get(test_file, {})
+                if not classes:
+                    continue
+                found_any = True
+                selected[test_file]["triggered_by"]    = [original_trigger]
+                selected[test_file]["matched_symbols"].append(sym)
+                selected[test_file]["classes"].update(classes)
 
     if not found_any:
         return {}
@@ -309,20 +568,50 @@ def _function_level_select(
     return dict(selected)
 
 
-def _proximity_fallback(
-    rel: str,
+def _add_file_level_tests(
+    selected_tests: dict,
+    file_level_tests: set,
     test_inventory: dict,
-    dir_mapping: list,
-) -> set:
+    trigger: str,
+    mode: str,
+) -> None:
+    for test_file in file_level_tests:
+        classes = test_inventory.get(test_file, {})
+        if not classes:
+            continue
+        if test_file not in selected_tests:
+            selected_tests[test_file] = {
+                "triggered_by":    [trigger],
+                "matched_symbols": [],
+                "selection_mode":  mode,
+                "classes":         dict(classes),
+            }
+        else:
+            if trigger not in selected_tests[test_file]["triggered_by"]:
+                selected_tests[test_file]["triggered_by"].append(trigger)
+
+
+def _merge_into_selected(selected_tests: dict, new_selections: dict) -> None:
+    for test_file, data in new_selections.items():
+        if test_file not in selected_tests:
+            selected_tests[test_file] = data
+        else:
+            selected_tests[test_file]["triggered_by"] = sorted(set(
+                selected_tests[test_file]["triggered_by"] + data["triggered_by"]
+            ))
+            selected_tests[test_file]["matched_symbols"] = sorted(set(
+                selected_tests[test_file]["matched_symbols"] + data["matched_symbols"]
+            ))
+            selected_tests[test_file]["classes"].update(data["classes"])
+
+
+def _proximity_fallback(rel: str, test_inventory: dict, dir_mapping: list) -> set:
     if dir_mapping:
         for mapping in dir_mapping:
             src_prefix  = mapping.get("source", "")
             test_prefix = mapping.get("tests", "")
             if rel.startswith(src_prefix):
-                return {
-                    tf for tf in test_inventory
-                    if tf.startswith(test_prefix)
-                }
+                return {tf for tf in test_inventory if tf.startswith(test_prefix)}
 
     changed_parts = set(Path(rel).parts)
     candidates    = set()
@@ -330,7 +619,6 @@ def _proximity_fallback(
         test_parts = set(Path(test_file).parts)
         if len(changed_parts & test_parts) >= 2:
             candidates.add(test_file)
-
     return candidates
 
 
@@ -349,14 +637,12 @@ def get_pytest_node_ids(selected: dict) -> list:
     return sorted(set(node_ids))
 
 
-def get_summary_info(selected: dict) -> tuple[list, dict]:
+def get_summary_info(selected: dict) -> tuple:
     selected_classes = []
     class_test_count = {}
-
     for test_file, data in selected.items():
         for cls_name, cls_data in data["classes"].items():
             label = f"{test_file}::{cls_name}"
             selected_classes.append(label)
             class_test_count[cls_name] = cls_data["test_count"]
-
     return selected_classes, class_test_count

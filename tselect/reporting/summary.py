@@ -1,5 +1,4 @@
 def _short_reason(reason: str, max_len: int = 60) -> str:
-    """Truncate reason to a short single line."""
     reason = reason.strip().rstrip(".")
     if len(reason) <= max_len:
         return reason
@@ -7,45 +6,32 @@ def _short_reason(reason: str, max_len: int = 60) -> str:
 
 
 def _build_audit(ai_decisions: list) -> dict:
-    """
-    Classify each AI decision into one of 4 buckets for the audit report.
-
-    Buckets:
-      correct_keeps    — kept, confidence >= 0.75  (high confidence, likely right)
-      correct_removes  — removed, confidence >= 0.75 (high confidence removal)
-      safety_keeps     — kept, confidence < 0.75   (safety rule fired, uncertain)
-      risky_removes    — removed, confidence < 0.75 (shouldn't happen, safety rule prevents)
-
-    Also flags potential false positives: kept at high confidence but reason
-    mentions "unrelated" or "does not directly" — LLM contradicted itself.
-    """
     correct_keeps   = []
     correct_removes = []
     safety_keeps    = []
-    contradictions  = []   # kept at low confidence with reason saying unrelated
+    contradictions  = []
+
+    negative_phrases = [
+        "does not directly", "unrelated", "not directly test",
+        "no direct", "indirect", "not related"
+    ]
 
     for d in ai_decisions:
         conf       = d.get("confidence", 0.0)
         should_run = d.get("should_run", True)
         reason     = d.get("reason", "").lower()
-
-        # detect contradictions: kept but reason sounds negative
-        negative_phrases = [
-            "does not directly", "unrelated", "not directly test",
-            "no direct", "indirect", "not related"
-        ]
         reason_sounds_negative = any(p in reason for p in negative_phrases)
 
         if should_run:
             if conf >= 0.75:
                 if reason_sounds_negative:
-                    contradictions.append(d)   # false positive risk
+                    contradictions.append(d)
                 else:
                     correct_keeps.append(d)
             else:
-                safety_keeps.append(d)         # safety rule fired
+                safety_keeps.append(d)
         else:
-            correct_removes.append(d)          # removed with confidence
+            correct_removes.append(d)
 
     return {
         "correct_keeps":   correct_keeps,
@@ -54,6 +40,111 @@ def _build_audit(ai_decisions: list) -> dict:
         "contradictions":  contradictions,
     }
 
+
+def _print_audit(ai_decisions: list, W: int = 70) -> None:
+    """Print the Selection Audit block. Shared by both report functions."""
+    audit = _build_audit(ai_decisions)
+
+    print("  " + "─" * (W - 4))
+    print("  Selection Audit")
+    print("  " + "─" * (W - 4))
+
+    if audit["correct_keeps"]:
+        print(f"  ✅ HIGH CONFIDENCE SELECTIONS  ({len(audit['correct_keeps'])} files)")
+        for d in audit["correct_keeps"]:
+            fname  = d["test_file"].split("/")[-1]
+            reason = _short_reason(d.get("reason", ""), 55)
+            conf   = d.get("confidence", 0.0)
+            print(f"     {fname:<40}  ({conf:.2f})  {reason}")
+        print()
+
+    if audit["correct_removes"]:
+        print(f"  ❌ HIGH CONFIDENCE REMOVALS  ({len(audit['correct_removes'])} files)")
+        for d in audit["correct_removes"]:
+            fname  = d["test_file"].split("/")[-1]
+            reason = _short_reason(d.get("reason", ""), 55)
+            conf   = d.get("confidence", 0.0)
+            print(f"     {fname:<40}  ({conf:.2f})  {reason}")
+        print()
+
+    if audit["safety_keeps"]:
+        print(f"  ⚠️  KEPT BY SAFETY RULE  ({len(audit['safety_keeps'])} files)")
+        print(f"     (LLM was uncertain → kept to avoid missing bugs)")
+        for d in audit["safety_keeps"]:
+            fname  = d["test_file"].split("/")[-1]
+            conf   = d.get("confidence", 0.0)
+            print(f"     {fname:<40}  ({conf:.2f})  reason unclear")
+        print()
+
+    if audit["contradictions"]:
+        print(f"  ⚠️  POTENTIAL FALSE POSITIVES  ({len(audit['contradictions'])} files)")
+        print(f"     (kept at high confidence but reason suggests unrelated)")
+        for d in audit["contradictions"]:
+            fname  = d["test_file"].split("/")[-1]
+            reason = _short_reason(d.get("reason", ""), 55)
+            conf   = d.get("confidence", 0.0)
+            print(f"     {fname:<40}  ({conf:.2f})  {reason}")
+        print()
+
+    total     = len(ai_decisions)
+    confident = len(audit["correct_keeps"]) + len(audit["correct_removes"])
+    uncertain = len(audit["safety_keeps"]) + len(audit["contradictions"])
+    score     = confident / max(total, 1)
+    print(f"  Decision quality : {confident}/{total} high-confidence  ({score:.0%})")
+    if uncertain > 0:
+        print(f"  Uncertain        : {uncertain} files kept conservatively")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY 1 — AI SELECTION REPORT  (printed right after AI filtering, before pytest)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_ai_summary(selected: dict, ai_decisions: list) -> None:
+    """
+    Printed immediately after pre_filter.filter(), before pytest runs.
+    Shows per-file decisions + full selection audit.
+    No time info here — tests haven't run yet.
+    """
+    if not ai_decisions:
+        return
+
+    W = 70
+    kept    = [d for d in ai_decisions if d["should_run"]]
+    removed = [d for d in ai_decisions if not d["should_run"]]
+
+    print()
+    print("=" * W)
+    print("  tselect — AI Selection Report")
+    print("=" * W)
+    print()
+    print(f"  Candidates evaluated : {len(ai_decisions)}")
+    print(f"  Selected             : {len(kept)}")
+    print(f"  Removed by AI        : {len(removed)}")
+    print()
+
+    print("  " + "─" * (W - 4))
+    print("  Per-File Decisions")
+    print("  " + "─" * (W - 4))
+    for d in ai_decisions:
+        icon   = "✅" if d["should_run"] else "❌"
+        action = "kept   " if d["should_run"] else "removed"
+        conf   = d.get("confidence", 0.0)
+        reason = _short_reason(d.get("reason", ""))
+        fname  = d["test_file"].split("/")[-1]
+        print(f"  {icon} {action}  {fname:<45}  ({conf:.2f})")
+        print(f"            {reason}")
+    print()
+
+    _print_audit(ai_decisions, W)
+
+    print("=" * W)
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY 2 — EXECUTION REPORT  (printed after pytest finishes)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def generate_summary(
     components,
@@ -68,14 +159,14 @@ def generate_summary(
     ai_removed    = 0,
     ai_confidence = None,
     ai_analysis   = None,
-):
+) -> None:
     """
-    Pretty CI-style report output for tselect.
+    Printed after pytest finishes.
+    Shows test counts, selection audit, and baseline comparison.
+    Duration line is plain — no time comparison here.
+    Baseline comparison appears once only, in the Insights section.
     """
 
-    # -------------------------------------------------
-    # DERIVED VALUES
-    # -------------------------------------------------
     if failed > 0 and passed > 0:
         status_icon = "⚠  PARTIAL FAIL"
     elif failed > 0:
@@ -89,13 +180,9 @@ def generate_summary(
         time_saved    = max(0, baseline - duration)
         percent_saved = (time_saved / baseline) * 100
 
-    executed      = passed + failed + skipped
-    ai_decisions  = ai_decisions or []
-    tests_before  = executed + sum(
-        d.get("test_count", 0)
-        for d in ai_decisions if not d["should_run"]
-    )
-    ai_percent    = (
+    executed     = passed + failed + skipped
+    ai_decisions = ai_decisions or []
+    ai_percent   = (
         (ai_removed / max(len(ai_decisions), 1)) * 100
         if ai_removed else 0
     )
@@ -104,131 +191,48 @@ def generate_summary(
     complexity   = "Low" if n_components <= 2 else "Medium" if n_components <= 5 else "High"
     comp_str     = ", ".join(sorted(components)) if components else "—"
 
-    W = 70  # width
+    W = 70
 
-    # -------------------------------------------------
-    # HEADER
-    # -------------------------------------------------
+    # ── header ─────────────────────────────────────────────────────────────
     print()
     print("=" * W)
     print("  tselect — Automated Test Impact Analysis")
     print("=" * W)
     print()
     print(f"  Status       : {status_icon}")
-    print(f"  Duration     : {duration:.2f}s"
-          + (f"  (saved {time_saved:.0f}s — {percent_saved:.1f}% faster)" if baseline else ""))
+    print(f"  Duration     : {duration:.2f}s")          # ← plain, no comparison here
     print(f"  Components   : {comp_str}")
     print()
 
-    # -------------------------------------------------
-    # TEST COUNTS  (before → after)
-    # -------------------------------------------------
+    # ── test counts ────────────────────────────────────────────────────────
     print("  " + "─" * (W - 4))
     print("  Tests")
     print("  " + "─" * (W - 4))
     if ai_decisions:
-        print(f"  Before AI filter : {tests_before}")
-        print(f"  After  AI filter : {executed}  (-{tests_before - executed} tests, {ai_percent:.0f}% of files removed)")
-    else:
-        print(f"  Executed : {executed}")
+        print(f"  Before AI filter : {len(ai_decisions)} candidate files")
+        print(f"  After  AI filter : {len(ai_decisions) - ai_removed} files  "
+              f"({ai_removed} removed, {ai_percent:.0f}% filtered out)")
+    print(f"  Executed : {executed}")
     print(f"  Passed   : {passed}   Failed : {failed}   Skipped : {skipped}")
     print()
 
-    # -------------------------------------------------
-    # AI PRE-FILTER DECISIONS
-    # -------------------------------------------------
+    # ── selection audit ────────────────────────────────────────────────────
     if ai_decisions:
-        print("  " + "─" * (W - 4))
-        print("  AI Pre-filter")
-        print("  " + "─" * (W - 4))
-        for d in ai_decisions:
-            icon   = "✅" if d["should_run"] else "❌"
-            action = "kept   " if d["should_run"] else "removed"
-            conf   = d.get("confidence", 0.0)
-            reason = _short_reason(d.get("reason", ""))
-            fname  = d["test_file"].split("/")[-1]
-            print(f"  {icon} {action}  {fname:<45}  ({conf:.2f})")
-            print(f"            {reason}")
-        print()
+        _print_audit(ai_decisions, W)
 
-    # -------------------------------------------------
-    # SELECTION AUDIT
-    # -------------------------------------------------
-    if ai_decisions:
-        audit = _build_audit(ai_decisions)
-
-        print("  " + "─" * (W - 4))
-        print("  Selection Audit")
-        print("  " + "─" * (W - 4))
-
-        # correct keeps
-        if audit["correct_keeps"]:
-            print(f"  ✅ HIGH CONFIDENCE SELECTIONS  ({len(audit['correct_keeps'])} files)")
-            for d in audit["correct_keeps"]:
-                fname  = d["test_file"].split("/")[-1]
-                reason = _short_reason(d.get("reason", ""), 55)
-                conf   = d.get("confidence", 0.0)
-                print(f"     {fname:<40}  ({conf:.2f})  {reason}")
-            print()
-
-        # correct removes
-        if audit["correct_removes"]:
-            print(f"  ❌ HIGH CONFIDENCE REMOVALS  ({len(audit['correct_removes'])} files)")
-            for d in audit["correct_removes"]:
-                fname  = d["test_file"].split("/")[-1]
-                reason = _short_reason(d.get("reason", ""), 55)
-                conf   = d.get("confidence", 0.0)
-                print(f"     {fname:<40}  ({conf:.2f})  {reason}")
-            print()
-
-        # safety rule keeps
-        if audit["safety_keeps"]:
-            print(f"  ⚠️  KEPT BY SAFETY RULE  ({len(audit['safety_keeps'])} files)")
-            print(f"     (LLM was uncertain → kept to avoid missing bugs)")
-            for d in audit["safety_keeps"]:
-                fname = d["test_file"].split("/")[-1]
-                conf  = d.get("confidence", 0.0)
-                print(f"     {fname:<40}  ({conf:.2f})  reason unclear")
-            print()
-
-        # contradictions — potential false positives
-        if audit["contradictions"]:
-            print(f"  ⚠️  POTENTIAL FALSE POSITIVES  ({len(audit['contradictions'])} files)")
-            print(f"     (kept at high confidence but reason suggests unrelated)")
-            for d in audit["contradictions"]:
-                fname  = d["test_file"].split("/")[-1]
-                reason = _short_reason(d.get("reason", ""), 55)
-                conf   = d.get("confidence", 0.0)
-                print(f"     {fname:<40}  ({conf:.2f})  {reason}")
-                print(f"     → Risk: LOW (extra tests run, no missed bugs)")
-            print()
-
-        # overall audit score
-        total      = len(ai_decisions)
-        confident  = len(audit["correct_keeps"]) + len(audit["correct_removes"])
-        uncertain  = len(audit["safety_keeps"]) + len(audit["contradictions"])
-        score      = confident / max(total, 1)
-        print(f"  Decision quality : {confident}/{total} high-confidence  ({score:.0%})")
-        if uncertain > 0:
-            print(f"  Uncertain        : {uncertain} files kept conservatively")
-        print()
-
-    # -------------------------------------------------
-    # AI FAILURE ANALYSIS
-    # -------------------------------------------------
+    # ── AI failure analysis ────────────────────────────────────────────────
     if ai_analysis and failed > 0:
         print("  " + "─" * (W - 4))
         print("  AI Failure Analysis")
         print("  " + "─" * (W - 4))
-        print(f"  Root cause : {ai_analysis.get('root_cause_file', '—')}  →  {ai_analysis.get('root_cause_symbol', '—')}")
+        print(f"  Root cause : {ai_analysis.get('root_cause_file', '—')}"
+              f"  →  {ai_analysis.get('root_cause_symbol', '—')}")
         print(f"  Pattern    : {ai_analysis.get('failure_pattern', '—')}")
         print(f"  Explanation: {ai_analysis.get('explanation', '—')}")
         print(f"  Fix        : {ai_analysis.get('suggested_fix', '—')}")
         print()
 
-    # -------------------------------------------------
-    # INSIGHTS
-    # -------------------------------------------------
+    # ── insights ───────────────────────────────────────────────────────────
     print("  " + "─" * (W - 4))
     print("  Insights")
     print("  " + "─" * (W - 4))
@@ -236,7 +240,8 @@ def generate_summary(
     print(f"  Confidence Score : {conf_str}")
     print(f"  PR Complexity    : {complexity}  ({n_components} components changed)")
     if baseline:
-        print(f"  Baseline         : {baseline:.2f}s  →  {duration:.2f}s  ({percent_saved:.1f}% faster)")
+        print(f"  Baseline         : {baseline:.2f}s  →  {duration:.2f}s"
+              f"  ({percent_saved:.1f}% faster)")     # ← one place only
     print()
     print("=" * W)
     print()

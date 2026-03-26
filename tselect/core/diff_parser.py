@@ -1,3 +1,4 @@
+from typing import Optional
 """
 diff_parser.py
 --------------
@@ -191,7 +192,7 @@ def _functions_at_lines(file_path: Path, changed_lines: set) -> set:
     return symbols
 
 
-def _find_parent_class(tree: ast.AST, target_node: ast.AST) -> str | None:
+def _find_parent_class(tree: ast.AST, target_node: ast.AST) -> Optional[str]:
     """
     Walk the AST to find if target_node is directly inside a ClassDef.
     Returns the class name or None.

@@ -1,9 +1,9 @@
 import subprocess
 
-def get_changed_files():
+def get_changed_files(base="upstream/main", target="HEAD"):
     try:
         result = subprocess.run(
-            ["git", "show", "--name-only", "--format=", "HEAD"],
+            ["git", "diff", "--name-only", f"{base}...{target}"],
             capture_output=True,
             text=True,
             check=True,

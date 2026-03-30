@@ -38,6 +38,60 @@ PY_EXTENSIONS  = {'.py'}
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
+def get_all_symbols(file_path: Path) -> set[str]:
+    """
+    Extract ALL function/class names from a file — no line filtering.
+
+    Used by graph_builder to build the public symbol index for source files.
+    Supports .py (tree-sitter → ast fallback) and .cpp/.cu/.h (tree-sitter).
+
+    Examples:
+        torch/optim/sgd.py      → {"SGD", "SGD.step", "SGD.zero_grad", ...}
+        torch/csrc/jit/ir.cpp   → {"Graph::insertNode", "Node::replaceInput", ...}
+    """
+    suffix = file_path.suffix.lower()
+    if suffix in PY_EXTENSIONS:
+        parser = _get_parser('python')
+        if parser:
+            try:
+                tree = parser.parse(file_path.read_bytes())
+                return {name for _, _, name in _collect_definitions(tree.root_node, 'python')}
+            except Exception:
+                pass
+        return _ast_all_symbols(file_path)
+
+    elif suffix in CPP_EXTENSIONS:
+        parser = _get_parser('cpp')
+        if parser:
+            try:
+                tree = parser.parse(file_path.read_bytes())
+                return {name for _, _, name in _collect_definitions(tree.root_node, 'cpp')}
+            except Exception:
+                pass
+
+    return set()
+
+
+def get_all_identifiers(file_path: Path) -> set[str]:
+    """
+    Extract ALL identifiers referenced in a file.
+
+    Used by graph_builder to build file_identifiers for the BFS stopping
+    condition in graph_selector — "does this importer use anything that changed?"
+
+    .py  → ast walk (Name + Attribute nodes)
+    .cpp/.cu/.h → tree-sitter identifier node walk
+    """
+    suffix = file_path.suffix.lower()
+    if suffix in PY_EXTENSIONS:
+        return _ast_all_identifiers(file_path)
+    elif suffix in CPP_EXTENSIONS:
+        parser = _get_parser('cpp')
+        if parser:
+            return _ts_cpp_identifiers(parser, file_path)
+    return set()
+
+
 def extract_symbols_at_lines(file_path: Path, changed_lines: set[int]) -> set[str]:
     """
     Return the set of function/class names that contain any of the changed lines.
@@ -280,6 +334,66 @@ def _cpp_name_from_declarator_chain(node) -> Optional[str]:
 def _node_lines(node) -> tuple[int, int]:
     """Return (start_line, end_line) as 1-based integers."""
     return node.start_point[0] + 1, node.end_point[0] + 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph-builder helpers (whole-file, no line filtering)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ast_all_symbols(file_path: Path) -> set[str]:
+    """ast fallback: top-level function/class/assignment names from a .py file."""
+    symbols = set()
+    try:
+        source = file_path.read_text(encoding='utf-8', errors='ignore')
+        tree   = ast.parse(source)
+    except Exception:
+        return symbols
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            symbols.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    symbols.add(target.id)
+    return symbols
+
+
+def _ast_all_identifiers(file_path: Path) -> set[str]:
+    """ast: all Name + Attribute identifiers referenced in a .py file."""
+    identifiers = set()
+    try:
+        source = file_path.read_text(encoding='utf-8', errors='ignore')
+        tree   = ast.parse(source)
+    except Exception:
+        return identifiers
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id and not node.id.startswith('__'):
+                identifiers.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            if node.attr and not node.attr.startswith('__'):
+                identifiers.add(node.attr)
+    return identifiers
+
+
+def _ts_cpp_identifiers(parser, file_path: Path) -> set[str]:
+    """tree-sitter: collect all identifier leaf nodes from a C/C++ file."""
+    identifiers = set()
+    try:
+        tree = parser.parse(file_path.read_bytes())
+    except Exception:
+        return identifiers
+
+    def _walk(node):
+        if node.type == 'identifier':
+            name = node.text.decode('utf-8', errors='ignore')
+            if name and not name.startswith('__'):
+                identifiers.add(name)
+        for child in node.children:
+            _walk(child)
+
+    _walk(tree.root_node)
+    return identifiers
 
 
 # ─────────────────────────────────────────────────────────────────────────────

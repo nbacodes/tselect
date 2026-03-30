@@ -17,28 +17,41 @@ Three-phase build:
 
   Phase 3: compute dynamic fanout threshold from distribution gap
 
-Changes from 2.1:
+Changes from 2.1 → 3.0:
   - function_reverse_graph now maps to test METHODS not test FILES
     "sgd.py::SGD" → ["test_optim.py::TestOptimCPU::test_sgd_momentum", ...]
-    Enables method-level selection — run 3 tests not 480
   - file_identifiers: every source file's identifier set
     Used by graph_selector for identifier overlap BFS stopping condition
   - fanout_threshold: computed from actual repo distribution gap
-    Not hardcoded — works for any repo
+
+Changes from 3.0 → 3.1 (tree-sitter upgrade):
+  - _extract_public_symbols: now uses tree-sitter via fn_diff.get_all_symbols()
+    Supports .py AND .cpp/.cu/.h — no more silent skips for C++ source files
+  - _extract_all_identifiers: now uses tree-sitter via fn_diff.get_all_identifiers()
+    C++ identifier walk via tree-sitter CST instead of ast-only
+  - _build_source_reverse_graph: handles #include for C/C++ files in addition to
+    Python import statements
+  - Test file parsing (_extract_symbol_references, _extract_method_level_references)
+    stays ast-based — PyTorch test files are always .py
 """
 
 import ast
 import json
+import re
 import subprocess
 import sys
 import time
 from collections import defaultdict
 from pathlib import Path
 
+from tselect.core.fn_diff import get_all_symbols, get_all_identifiers
 
 SUPPORTED_LANGUAGES   = {"python"}
 COMING_SOON_LANGUAGES = {"java", "javascript", "typescript", "go", "cpp"}
 DEFAULT_HIGH_FANOUT_THRESHOLD = 30
+
+CPP_EXTENSIONS = {'.cpp', '.cu', '.cuh', '.h', '.hpp', '.cc', '.c'}
+PY_EXTENSIONS  = {'.py'}
 
 
 class UnsupportedLanguageError(Exception):
@@ -74,33 +87,23 @@ class GraphBuilder:
         )
 
     # ─────────────────────────────────────────────
-    # SOURCE: extract public symbols
+    # SOURCE: extract public symbols  (tree-sitter)
     # ─────────────────────────────────────────────
 
     def _extract_public_symbols(self, file_path: Path) -> set:
         """
         All top-level names from a source file.
         Used for conservative fallback when test imports entire module.
+
+        Now delegates to fn_diff.get_all_symbols() which uses tree-sitter,
+        supporting .py AND .cpp/.cu/.h source files.
+
+        Falls back to ast for .py if tree-sitter is not installed.
         """
-        symbols = set()
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="ignore")
-            tree   = ast.parse(source)
-        except Exception:
-            return symbols
-
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                symbols.add(node.name)
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        symbols.add(target.id)
-
-        return symbols
+        return get_all_symbols(file_path)
 
     # ─────────────────────────────────────────────
-    # SOURCE: extract all identifiers (NEW)
+    # SOURCE: extract all identifiers  (tree-sitter)
     # ─────────────────────────────────────────────
 
     def _extract_all_identifiers(self, file_path: Path) -> set:
@@ -108,38 +111,20 @@ class GraphBuilder:
         Extract every identifier referenced in a source file.
         Used to build file_identifiers for BFS stopping condition.
 
-        Collects:
-          - ast.Name nodes (variable names, function calls, class references)
-          - ast.Attribute nodes (method names, attribute accesses)
+        Now delegates to fn_diff.get_all_identifiers():
+          .py  → ast walk (Name + Attribute nodes)
+          .cpp/.cu/.h → tree-sitter identifier node walk
 
         Example for torch/optim/__init__.py:
             {"SGD", "Adam", "RMSprop", "step", "zero_grad", "momentum", ...}
 
-        Example for torch/_dynamo/eval_frame.py:
-            {"OptimizedModule", "compiler_fn", "skip", "resume_execution", ...}
-
-        At BFS time: if changed_symbols ∩ file_identifiers[importer] == empty
-        → importer doesn't use anything that changed → stop BFS here
+        Example for torch/csrc/jit/runtime/interpreter.cpp:
+            {"InterpreterState", "run", "Frame", "push", "pop", ...}
         """
-        identifiers = set()
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="ignore")
-            tree   = ast.parse(source)
-        except Exception:
-            return identifiers
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                if node.id and not node.id.startswith("__"):
-                    identifiers.add(node.id)
-            elif isinstance(node, ast.Attribute):
-                if node.attr and not node.attr.startswith("__"):
-                    identifiers.add(node.attr)
-
-        return identifiers
+        return get_all_identifiers(file_path)
 
     # ─────────────────────────────────────────────
-    # DYNAMIC FANOUT THRESHOLD (NEW)
+    # DYNAMIC FANOUT THRESHOLD
     # ─────────────────────────────────────────────
 
     def _compute_fanout_threshold(self, file_reverse_graph: dict) -> int:
@@ -153,12 +138,6 @@ class GraphBuilder:
             fanouts: ..., 28, 29, 30 ... 73, 116 ... 1075
             largest gap: 116 → 1075 (gap of 959)
             threshold = 116
-
-        This means: files with > 116 test dependents are infrastructure.
-        Files with <= 116 are specific enough to follow in BFS.
-
-        For any repo — threshold is derived from its own data.
-        No hardcoding needed.
         """
         fanouts = sorted(
             len(v) for v in file_reverse_graph.values() if len(v) > 0
@@ -186,37 +165,23 @@ class GraphBuilder:
         Parse all SOURCE files and build a reverse import graph:
             source_file → [source files that import it]
 
+        Python files: ast-based import parsing (ImportFrom, Import)
+        C/C++ files:  regex-based #include parsing
+
         Example:
             torch/optim/sgd.py → [torch/optim/__init__.py, torch/optim/optimizer.py]
+            torch/csrc/jit/ir.h → [torch/csrc/jit/runtime/interpreter.cpp]
         """
         forward = defaultdict(set)
 
         for src in self.source_files:
-            rel = str(src.relative_to(self.repo_root))
+            rel    = str(src.relative_to(self.repo_root))
+            suffix = src.suffix.lower()
 
-            try:
-                source = src.read_text(encoding="utf-8", errors="ignore")
-                tree   = ast.parse(source)
-            except Exception:
-                continue
-
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.module:
-                    imported = module_map.get(node.module)
-                    if imported and imported != rel:
-                        forward[rel].add(imported)
-
-                    for alias in node.names:
-                        child_mod = f"{node.module}.{alias.name}"
-                        child_src = module_map.get(child_mod)
-                        if child_src and child_src != rel:
-                            forward[rel].add(child_src)
-
-                elif isinstance(node, ast.Import):
-                    for alias in node.names:
-                        imported = module_map.get(alias.name)
-                        if imported and imported != rel:
-                            forward[rel].add(imported)
+            if suffix in PY_EXTENSIONS:
+                self._parse_py_imports(src, rel, module_map, forward)
+            elif suffix in CPP_EXTENSIONS:
+                self._parse_cpp_includes(src, rel, forward)
 
         reverse = defaultdict(set)
         for importer, importees in forward.items():
@@ -225,8 +190,78 @@ class GraphBuilder:
 
         return {k: sorted(v) for k, v in reverse.items()}
 
+    def _parse_py_imports(
+        self, src: Path, rel: str, module_map: dict, forward: dict
+    ) -> None:
+        """Parse Python import statements and populate forward graph."""
+        try:
+            source = src.read_text(encoding="utf-8", errors="ignore")
+            tree   = ast.parse(source)
+        except Exception:
+            return
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported = module_map.get(node.module)
+                if imported and imported != rel:
+                    forward[rel].add(imported)
+
+                for alias in node.names:
+                    child_mod = f"{node.module}.{alias.name}"
+                    child_src = module_map.get(child_mod)
+                    if child_src and child_src != rel:
+                        forward[rel].add(child_src)
+
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported = module_map.get(alias.name)
+                    if imported and imported != rel:
+                        forward[rel].add(imported)
+
+    def _parse_cpp_includes(self, src: Path, rel: str, forward: dict) -> None:
+        """
+        Parse C/C++ #include directives to build the source import graph.
+
+        Handles:
+            #include "torch/csrc/jit/ir.h"      → relative/project includes
+            #include <ATen/core/Tensor.h>        → angle-bracket includes
+
+        Skips system headers (no path separator or known system prefixes).
+        """
+        _SYSTEM_PREFIXES = ('std', 'c++', 'bits/', 'sys/', 'linux/')
+        include_re = re.compile(r'#\s*include\s*[<"]([^>"]+)[>"]')
+
+        try:
+            source = src.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return
+
+        repo_files = {
+            str(f.relative_to(self.repo_root)): str(f.relative_to(self.repo_root))
+            for f in self.source_files
+            if f.suffix.lower() in CPP_EXTENSIONS
+        }
+
+        for match in include_re.finditer(source):
+            include_path = match.group(1)
+
+            # skip pure system headers
+            if not any(include_path.startswith(p) for p in _SYSTEM_PREFIXES):
+                # direct match
+                if include_path in repo_files:
+                    if repo_files[include_path] != rel:
+                        forward[rel].add(repo_files[include_path])
+                else:
+                    # try matching by filename suffix
+                    # e.g. "ir.h" might match "torch/csrc/jit/ir.h"
+                    fname = Path(include_path).name
+                    for repo_rel in repo_files:
+                        if Path(repo_rel).name == fname and repo_rel != rel:
+                            forward[rel].add(repo_rel)
+                            break  # take first match only
+
     # ─────────────────────────────────────────────
-    # TEST: extract symbol-level references (file level)
+    # TEST: extract symbol-level references (ast — tests are .py)
     # ─────────────────────────────────────────────
 
     def _extract_symbol_references(self, test_path: Path, module_map: dict) -> dict:
@@ -301,7 +336,7 @@ class GraphBuilder:
         return dict(references)
 
     # ─────────────────────────────────────────────
-    # TEST: extract method-level references (NEW)
+    # TEST: extract method-level references (ast — tests are .py)
     # ─────────────────────────────────────────────
 
     def _extract_method_level_references(
@@ -315,22 +350,10 @@ class GraphBuilder:
                 "TestOptimCPU::test_sgd_momentum": {
                     "torch/optim/sgd.py": {"SGD", "step"},
                 },
-                "TestOptimCPU::test_adam": {
-                    "torch/optim/adam.py": {"Adam"},
-                }
             }
 
         This enables function_reverse_graph to map:
             "sgd.py::SGD" → ["test_optim.py::TestOptimCPU::test_sgd_momentum"]
-        Instead of:
-            "sgd.py::SGD" → ["test_optim.py"]
-
-        How it works:
-            1. Find file-level imports (alias_map) — same as _extract_symbol_references
-            2. For each test class → each test method:
-               walk only that method's AST subtree
-               find Name and Attribute nodes that match imported symbols
-               record which source files those symbols came from
         """
         method_references = {}
 
@@ -340,9 +363,9 @@ class GraphBuilder:
         except Exception:
             return method_references
 
-        # step 1: build file-level alias map (same as _extract_symbol_references)
-        alias_map    = {}   # local_name → (src_file, sym_or_None)
-        file_symbols = defaultdict(set)  # src_file → set of imported symbols
+        # step 1: file-level alias map
+        alias_map    = {}
+        file_symbols = defaultdict(set)
 
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
@@ -371,7 +394,7 @@ class GraphBuilder:
         if not alias_map:
             return method_references
 
-        # step 2: for each test class → each test method, find symbol usage
+        # step 2: per-method symbol walk
         for class_node in ast.walk(tree):
             if not isinstance(class_node, ast.ClassDef):
                 continue
@@ -385,16 +408,13 @@ class GraphBuilder:
                 method_key = f"{class_node.name}::{method_node.name}"
                 refs       = defaultdict(set)
 
-                # walk only this method's body
                 for node in ast.walk(method_node):
-                    # direct Name reference — e.g. SGD(...)
                     if isinstance(node, ast.Name):
                         name = node.id
                         if name in alias_map:
                             src_file, sym = alias_map[name]
                             refs[src_file].add(sym or name)
 
-                    # attribute access — e.g. module.something or opt.step()
                     elif isinstance(node, ast.Attribute):
                         attr = node.attr
                         if isinstance(node.value, ast.Name):
@@ -409,26 +429,23 @@ class GraphBuilder:
         return method_references
 
     # ─────────────────────────────────────────────
-    # PHASE 1: Build reverse graphs (updated)
+    # PHASE 1: Build reverse graphs
     # ─────────────────────────────────────────────
 
     def _build_reverse_graphs(self, module_map: dict) -> tuple:
         """
         Build three graphs simultaneously.
 
-        file_reverse_graph (unchanged):
+        file_reverse_graph:
             "torch/_inductor/scheduler.py" → ["test/inductor/test_scheduler.py", ...]
 
-        function_reverse_graph (UPDATED — now maps to test METHODS):
+        function_reverse_graph (maps to test METHODS):
             "torch/_inductor/scheduler.py::_fuse_nodes" →
                 ["test/inductor/test_scheduler.py::TestSchedulerCPU::test_fuse_nodes"]
-            "torch/optim/sgd.py::SGD" →
-                ["test/optim/test_optim.py::TestOptimCPU::test_sgd_momentum",
-                 "test/optim/test_optim.py::TestOptimCPU::test_sgd_dampening"]
 
-        file_identifiers (NEW):
-            "torch/optim/__init__.py" → ["SGD", "Adam", "step", "momentum", ...]
-            "torch/_dynamo/eval_frame.py" → ["OptimizedModule", "compiler_fn", ...]
+        file_identifiers (tree-sitter powered for .cpp/.cu as well as .py):
+            "torch/optim/__init__.py"              → ["SGD", "Adam", "step", ...]
+            "torch/csrc/jit/runtime/interpreter.cpp" → ["InterpreterState", "run", ...]
         """
         file_reverse     = defaultdict(set)
         function_reverse = defaultdict(set)
@@ -438,15 +455,12 @@ class GraphBuilder:
         for idx, test in enumerate(self.test_files):
             rel_test = str(test.relative_to(self.repo_root))
 
-            # file-level references (for file_reverse_graph)
             file_refs = self._extract_symbol_references(test, module_map)
-            for src_file, symbols in file_refs.items():
+            for src_file in file_refs:
                 file_reverse[src_file].add(rel_test)
 
-            # method-level references (for function_reverse_graph)
             method_refs = self._extract_method_level_references(test, module_map)
             for method_key, src_refs in method_refs.items():
-                # method_key = "TestClass::test_method"
                 full_method_id = f"{rel_test}::{method_key}"
                 for src_file, symbols in src_refs.items():
                     for sym in symbols:
@@ -456,8 +470,8 @@ class GraphBuilder:
             if (idx + 1) % 100 == 0:
                 print(f"    [{idx+1}/{total} test files processed]")
 
-        # file_identifiers for source files
-        print("  Building file identifier index for BFS stopping condition...")
+        # file_identifiers — now tree-sitter powered for .cpp/.cu too
+        print("  Building file identifier index (tree-sitter) ...")
         for src in self.source_files:
             rel = str(src.relative_to(self.repo_root))
             ids = self._extract_all_identifiers(src)
@@ -596,14 +610,14 @@ class GraphBuilder:
                 module_map[package_name] = str(rel)
 
         # Phase 0: source → source reverse graph
-        print("  Phase 0: Building source import graph (transitive deps)...")
+        print("  Phase 0: Building source import graph (Python + C++ includes)...")
         t0 = time.time()
         source_reverse_graph = self._build_source_reverse_graph(module_map)
         print(f"    Done in {time.time() - t0:.2f}s  —  "
               f"{len(source_reverse_graph)} source files have dependents")
 
-        # Phase 1: test → source reverse graphs + file identifiers
-        print("  Phase 1: Building file + function graph + identifier index...")
+        # Phase 1: test → source reverse graphs + file identifiers (tree-sitter)
+        print("  Phase 1: Building file + function graph + identifier index (tree-sitter)...")
         t1 = time.time()
         file_reverse, function_reverse, file_identifiers = self._build_reverse_graphs(module_map)
 
@@ -638,13 +652,13 @@ class GraphBuilder:
               f"(computed from distribution gap)")
 
         return {
-            "schema_version":         "3.0",
+            "schema_version":         "3.1",
             "language":               self.language,
             "source_reverse_graph":   source_reverse_graph,
             "full_reverse_graph":     file_reverse,
-            "function_reverse_graph": function_reverse,   # now maps to test METHODS
-            "file_identifiers":       file_identifiers,   # NEW
-            "fanout_threshold":       fanout_threshold,   # NEW
+            "function_reverse_graph": function_reverse,
+            "file_identifiers":       file_identifiers,
+            "fanout_threshold":       fanout_threshold,
             "test_inventory":         test_inventory,
             "built_at":               time.time(),
         }

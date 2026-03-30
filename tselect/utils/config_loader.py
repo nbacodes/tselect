@@ -14,15 +14,14 @@ Design:
 from pathlib import Path
 from .loader import load_yaml
 
-
 # ── Defaults ──────────────────────────────────────────────────────────────────
 # These apply when tselect.yaml is missing or a field is not specified.
 
 DEFAULTS = {
     "repo": {
-        "language":    None,       # None = auto-detect
-        "source_dirs": None,       # None = auto-detect via layout inferer
-        "test_dirs":   None,       # None = auto-detect via layout inferer
+        "language":    None,   # None = auto-detect
+        "source_dirs": None,   # None = auto-detect via layout inferer
+        "test_dirs":   None,   # None = auto-detect via layout inferer
     },
     "graph": {
         "rebuild_after_days":  7,
@@ -46,16 +45,16 @@ DEFAULTS = {
         "fail_on_test_failure": True,
     },
     "ml": {
-        "enabled":           False,
-        "min_history_days":  14,
+        "enabled":          False,
+        "min_history_days": 14,
     },
     "ai": {
-        "enabled":              True,    # opt-out model
-        "api_key":              "",
+        "enabled":              True,
+        "groq_api_key":         "",     # set via tselect init or manually in yaml
         "model":                "llama-3.3-70b-versatile",
         "timeout":              15,
         "confidence_threshold": 0.75,
-    }
+    },
 }
 
 
@@ -86,14 +85,13 @@ def load_tselect_config(repo_root: Path) -> dict:
 
     Usage:
         config = load_tselect_config(repo_root)
-        source_dirs = config["repo"]["source_dirs"]   # list or None
-        batch_size  = config["graph"]["collect_batch_size"]  # int
+        source_dirs  = config["repo"]["source_dirs"]          # list or None
+        batch_size   = config["graph"]["collect_batch_size"]  # int
+        groq_api_key = config["ai"]["groq_api_key"]           # str or ""
     """
     config_path = Path(repo_root) / "tselect.yaml"
 
     if not config_path.exists():
-        # no config file — return pure defaults
-        # layout inferer will auto-detect source/test dirs
         return _deep_merge(DEFAULTS, {})
 
     try:
@@ -102,6 +100,13 @@ def load_tselect_config(repo_root: Path) -> dict:
         print(f"  ⚠️  Could not parse tselect.yaml: {e}")
         print(f"       Using defaults.")
         return _deep_merge(DEFAULTS, {})
+
+    # backward compat: old configs used ai.api_key, new ones use ai.groq_api_key
+    # if someone has the old key, migrate it transparently
+    ai_section = user_config.get("ai", {})
+    if "api_key" in ai_section and "groq_api_key" not in ai_section:
+        ai_section["groq_api_key"] = ai_section.pop("api_key")
+        user_config["ai"] = ai_section
 
     return _deep_merge(DEFAULTS, user_config)
 

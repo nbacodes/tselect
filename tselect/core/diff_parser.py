@@ -1,17 +1,23 @@
-
-from typing import Optional
 """
 diff_parser.py
 --------------
 Parses git diff output to extract which functions/classes actually changed.
 
 Supports PR mode (base...HEAD) and avoids incorrect fallbacks.
+
+Now delegates symbol extraction to fn_diff.py (tree-sitter based),
+which supports .py, .cpp, .cu, .cuh, .h, .hpp files.
 """
 
-import ast
+from typing import Optional
 import re
 import subprocess
 from pathlib import Path
+
+from tselect.core.fn_diff import extract_symbols_at_lines
+
+# Extensions we attempt function-level extraction for
+SUPPORTED_EXTENSIONS = {'.py', '.cpp', '.cu', '.cuh', '.h', '.hpp', '.cc', '.c'}
 
 
 def get_changed_functions(repo_root: Path, changed_files: list, base="upstream/main") -> dict:
@@ -20,20 +26,22 @@ def get_changed_functions(repo_root: Path, changed_files: list, base="upstream/m
 
     Returns:
         {
-            "torch/_inductor/scheduler.py": {
-                "_fuse_nodes",
-                "BaseScheduler",
-            },
+            "torch/_inductor/scheduler.py": {"_fuse_nodes", "BaseScheduler"},
+            "torch/csrc/jit/runtime/interpreter.cpp": {"InterpreterState::run"},
         }
 
     If a file has no function-level info, returns {"__unknown__"}.
+    Non-code / unsupported files return set() so the caller skips them.
     """
     result = {}
 
     for cf in changed_files:
         rel = _normalize(cf, repo_root)
 
-        if not rel.endswith(".py"):
+        suffix = Path(rel).suffix.lower()
+
+        # Unsupported extension → return empty set (caller handles gracefully)
+        if suffix not in SUPPORTED_EXTENSIONS:
             result[rel] = set()
             continue
 
@@ -49,12 +57,10 @@ def get_changed_functions(repo_root: Path, changed_files: list, base="upstream/m
             result[rel] = {"__unknown__"}
             continue
 
-        symbols = _functions_at_lines(full_path, changed_lines)
+        # Delegate to fn_diff (tree-sitter based, with ast fallback for .py)
+        symbols = extract_symbols_at_lines(full_path, changed_lines)
 
-        if not symbols:
-            symbols = {"__unknown__"}
-
-        result[rel] = symbols
+        result[rel] = symbols if symbols else {"__unknown__"}
 
     return result
 
@@ -69,6 +75,7 @@ def _normalize(path_str: str, repo_root: Path) -> str:
 def _get_changed_lines(repo_root: Path, rel_path: str, base: str) -> set:
     """
     Extract changed line numbers using git diff base...HEAD
+    Returns 1-based line numbers matching what tree-sitter/ast produce.
     """
     try:
         result = subprocess.run(
@@ -88,7 +95,6 @@ def _get_changed_lines(repo_root: Path, rel_path: str, base: str) -> set:
         return set()
 
     changed_lines = set()
-
     hunk_pattern = re.compile(
         r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@",
         re.MULTILINE
@@ -96,64 +102,10 @@ def _get_changed_lines(repo_root: Path, rel_path: str, base: str) -> set:
 
     for match in hunk_pattern.finditer(diff_output):
         start = int(match.group(1))
-        count = int(match.group(2)) if match.group(2) else 1
+        count = int(match.group(2)) if match.group(2) is not None else 1
 
         if count > 0:
             for line_no in range(start, start + count):
                 changed_lines.add(line_no)
 
     return changed_lines
-
-
-def _functions_at_lines(file_path: Path, changed_lines: set) -> set:
-    symbols = set()
-
-    try:
-        source = file_path.read_text(encoding="utf-8", errors="ignore")
-        tree = ast.parse(source)
-    except Exception:
-        return symbols
-
-    definitions = []
-
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            parent_class = _find_parent_class(tree, node)
-
-            if parent_class:
-                name = f"{parent_class}.{node.name}"
-            else:
-                name = node.name
-
-            end_line = getattr(node, "end_lineno", None)
-            if end_line is None:
-                # fallback: assume large function, not small
-                end_line = node.lineno + 1000
-            definitions.append((node.lineno, end_line, name))
-
-        elif isinstance(node, ast.ClassDef):
-            end_line = getattr(node, "end_lineno", node.lineno + 200)
-            definitions.append((node.lineno, end_line, node.name))
-
-    covered_lines = set()
-
-    for start, end, name in definitions:
-        for line in changed_lines:
-            if start <= line <= end:
-                symbols.add(name)
-                covered_lines.add(line)
-
-    uncovered = changed_lines - covered_lines
-    if uncovered:
-        symbols.add("__module__")
-
-    return symbols
-
-
-def _find_parent_class(tree: ast.AST, target_node: ast.AST) -> Optional[str]:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            for child in ast.iter_child_nodes(node):
-                if child is target_node:
-                    return node.name
-    return None

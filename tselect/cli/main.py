@@ -8,10 +8,8 @@ Commands:
   tselect build-graph      → build dependency graph (run once)
   tselect run              → auto-detect changes, select + optionally run tests
   tselect run --execute    → select + run tests
+  tselect run --coverage   → select + run tests + diff_cover confidence score
   tselect baseline --execute → record full suite baseline time
-
-Config is read from tselect.yaml at repo root on every run.
-Falls back to sensible defaults if tselect.yaml is missing.
 """
 
 import argparse
@@ -69,34 +67,22 @@ def _print_section(title: str):
 
 
 def _filter_changed_files(changed_files: list, ignore_patterns: list) -> tuple[list, list]:
-    """
-    Split changed files into actionable (source) and ignored (data/config).
-    Returns (actionable, ignored).
-    """
     actionable = []
     ignored    = []
-
     for f in changed_files:
         filename = Path(f).name
         if should_ignore_file(filename, ignore_patterns):
             ignored.append(f)
         else:
             actionable.append(f)
-
     return actionable, ignored
 
 
 def _is_ai_enabled(config: dict) -> bool:
-    """AI is enabled by default (opt-out model)."""
     return config.get("ai", {}).get("enabled", True)
 
 
 def _run_ai_prefilter(selected, changed_files, repo_root, config):
-    """
-    Run LLM pre-filter on graph-selected candidates.
-    Returns (filtered_selected, ai_decisions).
-    Falls back to original selected on any error.
-    """
     from tselect.ai.llm_client import LLMClient, LLMClientError
     from tselect.ai.pre_filter import PreFilter
 
@@ -126,10 +112,6 @@ def _run_ai_prefilter(selected, changed_files, repo_root, config):
 
 def _run_ai_postanalysis(failed_tests, changed_files, repo_root, config,
                           passed, failed, skipped):
-    """
-    Run LLM post-analysis on test failures.
-    Returns analysis dict or None.
-    """
     from tselect.ai.llm_client import LLMClient, LLMClientError
     from tselect.ai.post_analyzer import PostAnalyzer
 
@@ -170,39 +152,28 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     # ── init ──
-    subparsers.add_parser(
-        "init",
-        help="Generate a starter tselect.yaml for this repo",
-    )
+    subparsers.add_parser("init", help="Generate a starter tselect.yaml for this repo")
 
     # ── build-graph ──
-    subparsers.add_parser(
-        "build-graph",
-        help="Build dependency graph (run once, or when repo structure changes)",
-    )
+    subparsers.add_parser("build-graph", help="Build dependency graph")
 
     # ── run ──
-    run_parser = subparsers.add_parser(
-        "run",
-        help="Select and optionally run tests for changed files",
+    run_parser = subparsers.add_parser("run", help="Select and optionally run tests")
+    run_parser.add_argument(
+        "--changed", nargs="+", required=False,
+        help="Changed files (auto-detected from git diff if omitted)",
     )
     run_parser.add_argument(
-        "--changed",
-        nargs="+",
-        required=False,
-        help="Changed files to analyze (auto-detected from git diff if omitted)",
-    )
-    run_parser.add_argument(
-        "--execute",
-        action="store_true",
+        "--execute", action="store_true",
         help="Execute the selected tests",
+    )
+    run_parser.add_argument(
+        "--coverage", action="store_true",
+        help="Run with coverage and generate diff_cover confidence score",
     )
 
     # ── baseline ──
-    baseline_parser = subparsers.add_parser(
-        "baseline",
-        help="Record full test suite baseline time for comparison",
-    )
+    baseline_parser = subparsers.add_parser("baseline", help="Record full suite baseline time")
     baseline_parser.add_argument("--execute", action="store_true")
 
     args = parser.parse_args()
@@ -212,7 +183,6 @@ def main():
 
     repo_root = Path.cwd()
 
-    # ── load config (every command reads it) ──
     config          = load_tselect_config(repo_root)
     ignore_patterns = config["runner"]["ignore_changed_patterns"]
     rebuild_days    = config["graph"]["rebuild_after_days"]
@@ -239,8 +209,8 @@ def main():
         print(f"  Repo   : {repo_root}")
 
         if (repo_root / "tselect.yaml").exists():
-            src  = config["repo"].get("source_dirs", [])
-            tst  = config["repo"].get("test_dirs", [])
+            src = config["repo"].get("source_dirs", [])
+            tst = config["repo"].get("test_dirs", [])
             print(f"  Source : {src}")
             print(f"  Tests  : {tst}")
         else:
@@ -304,7 +274,7 @@ def main():
 
         _print_header("tselect — Targeted Test Selection")
 
-        # ── step 1: get changed files ──
+        # step 1: get changed files
         if args.changed:
             logger.info("Using manually provided changed files")
             all_changed = args.changed
@@ -318,10 +288,8 @@ def main():
             print("\n  No changed files detected. Nothing to run.")
             return
 
-        # ── step 2: filter out non-source files ──
-        changed_files, ignored_files = _filter_changed_files(
-            all_changed, ignore_patterns
-        )
+        # step 2: filter
+        changed_files, ignored_files = _filter_changed_files(all_changed, ignore_patterns)
 
         print(f"\n  Changed files ({source}):")
         for f in changed_files:
@@ -337,30 +305,25 @@ def main():
             print("  Nothing to test.")
             return
 
-        # ── step 3: load graph ──
+        # step 3: load graph
         graph_loader = GraphLoader(repo_root)
-
-        # always define ai_decisions so generate_summary never fails
         ai_decisions = []
         ai_analysis  = None
 
         if graph_loader.exists():
             graph = graph_loader.load()
 
-            # warn if stale
             if _is_graph_stale(graph, rebuild_days):
                 print()
                 print(f"  ⚠️  Dependency graph is older than {rebuild_days} days.")
                 print("     Run 'tselect build-graph' to refresh it.")
 
-            # ── GRAPH MODE ──
             logger.info("Using auto-built dependency graph")
 
             selected, total_tests = select_tests_from_graph(
                 changed_files, graph, repo_root
             )
 
-            # ── AI pre-filter (runs after graph, before pytest) ──
             if _is_ai_enabled(config):
                 selected, ai_decisions = _run_ai_prefilter(
                     selected      = selected,
@@ -371,9 +334,7 @@ def main():
 
             node_ids                           = get_pytest_node_ids(selected)
             selected_classes, class_test_count = get_summary_info(selected)
-
-            # components = stem of each changed file for summary reporting
-            components = sorted(set(Path(f).stem for f in changed_files))
+            components                         = sorted(set(Path(f).stem for f in changed_files))
 
             _print_section(
                 f"Selected: {len(selected)} test files, "
@@ -396,13 +357,9 @@ def main():
                 print("    • Check source_dirs in tselect.yaml covers these files")
                 return
 
-            cmd = build_pytest_command(
-                node_ids,
-                extra_args=config["runner"]["extra_args"]
-            )
+            cmd = build_pytest_command(node_ids, extra_args=config["runner"]["extra_args"])
 
         else:
-            # ── LEGACY MODE ──
             print()
             print("  ⚠️  No dependency graph found.")
             print("  Run 'tselect build-graph' first for auto mode.")
@@ -429,7 +386,7 @@ def main():
 
             cmd = build_pytest_command_from_classes(list(selected_classes))
 
-        # ── step 4: print command ──
+        # step 4: print command
         print()
         print("  " + "─" * 56)
         print("  PYTEST COMMAND")
@@ -446,9 +403,19 @@ def main():
         if not args.execute:
             return
 
-        # ── step 5: execute ──
+        # step 5: execute
         _print_section("► Executing tests...")
         print()
+
+        # coverage setup — write .tselect_coveragerc, set env var, append cov args
+        coverage_data = None
+        if args.coverage:
+            from tselect.reporting.coverage import prepare_coverage
+            source_dir    = config.get("repo", {}).get("source_dirs", ["."])[0]
+            coverage_args = prepare_coverage(repo_root, source_dir=source_dir)
+            cmd           = cmd + coverage_args
+            print(f"  Coverage enabled — source: {source_dir}")
+            print()
 
         logger.info("Executing pytest run")
         start_time = time.time()
@@ -460,7 +427,14 @@ def main():
             f"(passed={passed}, failed={failed}, skipped={skipped})"
         )
 
-        # save baseline if none recorded yet
+        # run diff_cover after pytest
+        if args.coverage:
+            from tselect.reporting.coverage import run_diff_cover
+            compare_branch = config.get("coverage", {}).get("compare_branch", "origin/main")
+            print()
+            print("  ► Running diff-cover...")
+            coverage_data = run_diff_cover(repo_root, compare_branch=compare_branch)
+
         if baseline_time is None:
             print("\n  No baseline recorded yet — saving this run as baseline.")
             cache["baseline_time"] = duration
@@ -474,11 +448,10 @@ def main():
             else "PASSED"
         )
 
-        # ── AI post-analysis (only if tests failed) ──
         if _is_ai_enabled(config) and failed > 0:
             print("\n  🤖 AI analyzing failures...")
             ai_analysis = _run_ai_postanalysis(
-                failed_tests  = [],   # TODO: parse failed node IDs from pytest output
+                failed_tests  = [],
                 changed_files = changed_files,
                 repo_root     = repo_root,
                 config        = config,
@@ -504,7 +477,6 @@ def main():
             print("  Run: tselect build-graph")
             print()
 
-        # ── AI summary stats ──
         ai_removed    = sum(1 for d in ai_decisions if not d["should_run"])
         kept          = [d for d in ai_decisions if d["should_run"]]
         ai_confidence = (
@@ -525,9 +497,9 @@ def main():
             ai_removed    = ai_removed,
             ai_confidence = ai_confidence,
             ai_analysis   = ai_analysis,
+            coverage_data = coverage_data,
         )
 
-        # honour CI fail-on-failure setting
         if config["ci"]["fail_on_test_failure"] and return_code != 0:
             raise SystemExit(return_code)
 

@@ -97,15 +97,10 @@ def _print_audit(ai_decisions: list, W: int = 70) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUMMARY 1 — AI SELECTION REPORT  (printed right after AI filtering, before pytest)
+# SUMMARY 1 — AI SELECTION REPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_ai_summary(selected: dict, ai_decisions: list) -> None:
-    """
-    Printed immediately after pre_filter.filter(), before pytest runs.
-    Shows per-file decisions + full selection audit.
-    No time info here — tests haven't run yet.
-    """
     if not ai_decisions:
         return
 
@@ -143,7 +138,7 @@ def generate_ai_summary(selected: dict, ai_decisions: list) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUMMARY 2 — EXECUTION REPORT  (printed after pytest finishes)
+# SUMMARY 2 — EXECUTION REPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_summary(
@@ -159,12 +154,12 @@ def generate_summary(
     ai_removed    = 0,
     ai_confidence = None,
     ai_analysis   = None,
+    coverage_data = None,
 ) -> None:
     """
     Printed after pytest finishes.
-    Shows test counts, selection audit, and baseline comparison.
-    Duration line is plain — no time comparison here.
-    Baseline comparison appears once only, in the Insights section.
+    All existing sections unchanged.
+    Coverage section added at the bottom — only printed when --coverage used.
     """
 
     if failed > 0 and passed > 0:
@@ -193,18 +188,18 @@ def generate_summary(
 
     W = 70
 
-    # ── header ─────────────────────────────────────────────────────────────
+    # ── header ──────────────────────────────────────────────────────────────
     print()
     print("=" * W)
     print("  tselect — Automated Test Impact Analysis")
     print("=" * W)
     print()
     print(f"  Status       : {status_icon}")
-    print(f"  Duration     : {duration:.2f}s")          # ← plain, no comparison here
+    print(f"  Duration     : {duration:.2f}s")
     print(f"  Components   : {comp_str}")
     print()
 
-    # ── test counts ────────────────────────────────────────────────────────
+    # ── test counts ─────────────────────────────────────────────────────────
     print("  " + "─" * (W - 4))
     print("  Tests")
     print("  " + "─" * (W - 4))
@@ -216,11 +211,11 @@ def generate_summary(
     print(f"  Passed   : {passed}   Failed : {failed}   Skipped : {skipped}")
     print()
 
-    # ── selection audit ────────────────────────────────────────────────────
+    # ── selection audit ─────────────────────────────────────────────────────
     if ai_decisions:
         _print_audit(ai_decisions, W)
 
-    # ── AI failure analysis ────────────────────────────────────────────────
+    # ── AI failure analysis ─────────────────────────────────────────────────
     if ai_analysis and failed > 0:
         print("  " + "─" * (W - 4))
         print("  AI Failure Analysis")
@@ -232,7 +227,7 @@ def generate_summary(
         print(f"  Fix        : {ai_analysis.get('suggested_fix', '—')}")
         print()
 
-    # ── insights ───────────────────────────────────────────────────────────
+    # ── insights ────────────────────────────────────────────────────────────
     print("  " + "─" * (W - 4))
     print("  Insights")
     print("  " + "─" * (W - 4))
@@ -241,7 +236,14 @@ def generate_summary(
     print(f"  PR Complexity    : {complexity}  ({n_components} components changed)")
     if baseline:
         print(f"  Baseline         : {baseline:.2f}s  →  {duration:.2f}s"
-              f"  ({percent_saved:.1f}% faster)")     # ← one place only
+              f"  ({percent_saved:.1f}% faster)")
     print()
+
+    # ── coverage section — only shown when --coverage flag used ─────────────
+    if coverage_data:
+        from tselect.reporting.coverage import format_coverage_section
+        for line in format_coverage_section(coverage_data, W):
+            print(line)
+
     print("=" * W)
     print()

@@ -100,23 +100,6 @@ def _expand_transitively(
          (only applied when changed_symbols is non-empty and meaningful)
 
     No depth counter. BFS runs until guards stop everything.
-
-    Example:
-        changed: sgd.py, symbols: {SGD, step}
-
-        torch/optim/__init__.py:
-            fanout=22 <= threshold ✅
-            identifiers include "SGD" ✅
-            → follow
-
-        torch/_dynamo/eval_frame.py:
-            fanout=89 <= threshold ✅
-            identifiers do NOT include "SGD" or "step" ❌
-            → STOP — unrelated file
-
-        torch/__init__.py:
-            fanout=1107 > threshold ❌
-            → STOP — infrastructure
     """
     visited  = {changed_file}
     frontier = {changed_file}
@@ -146,7 +129,7 @@ def _expand_transitively(
                 if use_identifier_overlap:
                     importer_ids = set(file_identifiers.get(importer, []))
                     if importer_ids and not (base_symbols & importer_ids):
-                        continue   # importer doesn't use anything that changed
+                        continue
 
                 next_frontier.add(importer)
                 visited.add(importer)
@@ -178,7 +161,7 @@ def select_tests_from_graph(
     function_graph       = graph.get("function_reverse_graph", {})
     test_inventory       = graph.get("test_inventory", {})
     source_reverse_graph = graph.get("source_reverse_graph", {})
-    file_identifiers     = graph.get("file_identifiers", {})   # NEW
+    file_identifiers     = graph.get("file_identifiers", {})
     has_function_graph   = bool(function_graph)
     has_transitive       = bool(source_reverse_graph)
 
@@ -198,10 +181,8 @@ def select_tests_from_graph(
     for cf in changed_files:
         rel = _normalize(cf, repo_root)
 
-        # ✅ NEW: skip propagation from test files
+        # skip propagation from test files
         if rel.startswith(TEST_PATH_PREFIXES):
-            # still allow self-select (already handled below),
-            # but DO NOT propagate further
             pass
 
         # Pre-flight 1: test file self-select
@@ -225,12 +206,9 @@ def select_tests_from_graph(
             skipped_non_code.append(rel)
             continue
 
-        # Get changed symbols for this file — used for BFS + selection
+        # Get changed symbols for this file
         rel_symbols_changed = changed_functions.get(rel, set())
-
-        # Transitive expansion with identifier overlap stopping condition
-        # ✅ FIRST try function-level on original file
-        symbols_changed = rel_symbols_changed
+        symbols_changed     = rel_symbols_changed
 
         if has_function_graph and symbols_changed not in (set(), {"__unknown__"}):
             function_selected = _function_level_select(
@@ -239,10 +217,9 @@ def select_tests_from_graph(
             if function_selected:
                 _merge_into_selected(selected_tests, function_selected)
                 print(f"    Function-level hit: {rel} → skipping transitive expansion")
-                continue  # 🚨 CRITICAL: stop here
+                continue
 
-            # ← NEW: function lookup empty (e.g. decorator-registered aten ops)
-            # no test imports this function by name directly
+            # function lookup empty (e.g. decorator-registered aten ops)
             # fall back to file-level — much better than BFS explosion
             print(f"    [INFO] No function-level match for {rel} → file-level fallback")
             file_level_tests = set(reverse_graph.get(rel, []))
@@ -256,7 +233,7 @@ def select_tests_from_graph(
         elif symbols_changed in (set(), {"__unknown__"}):
             print(f"[WARN] No usable diff symbols for {rel} → skipping function-level")
 
-        # ⚠️ Only fallback case reaches here
+        # Only fallback case reaches here
         if has_transitive:
             expanded = _expand_transitively(
                 changed_file=rel,
@@ -287,7 +264,6 @@ def select_tests_from_graph(
             if expanded_file == rel:
                 symbols_changed = rel_symbols_changed
 
-                # ✅ STRICT function-level priority
                 if has_function_graph:
                     if symbols_changed not in (set(), {"__unknown__"}):
                         function_selected = _function_level_select(
@@ -299,7 +275,6 @@ def select_tests_from_graph(
 
                     elif symbols_changed == {"__unknown__"}:
                         print(f"[WARN] Low confidence diff for {rel} → shallow fallback")
-                        # allow fallback but DO NOT expand aggressively
 
                     else:
                         print(f"[WARN] No usable diff info for {rel} → skipping")
@@ -310,7 +285,6 @@ def select_tests_from_graph(
                     file_level_tests = _proximity_fallback(expanded_file, test_inventory, dir_mapping)
                     mode             = "proximity"
                 else:
-                    # ✅ ONLY allow file-level fallback for original file (not transitive explosion)
                     if expanded_file != rel:
                         continue
                     mode = "file"
@@ -382,6 +356,61 @@ def select_tests_from_graph(
 # Selection helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# device suffixes PyTorch parametrize adds to test method names
+_DEVICE_SUFFIXES = ('_cpu', '_cuda', '_mps', '_xpu', '_npu', '_hpu')
+
+
+def _resolve_mixin_class(
+    test_file: str,
+    cls_name: str,
+    method: str,
+    classes: dict,
+) -> dict:
+    """
+    Resolve mixin/base class test references to actual inventory entries.
+
+    PyTorch uses CommonTemplate as a mixin — tests defined there get
+    parametrized into CpuTests, GPUTests etc. with device suffixes:
+        CommonTemplate::test_max_pool2d_with_indices_backward6
+            → CpuTests::test_max_pool2d_with_indices_backward6_cpu
+            → GPUTests::test_max_pool2d_with_indices_backward6_mps
+
+    Strategy: for each class in inventory, strip device suffix from each
+    method name and check if it matches our target method name.
+
+    No hardcoding of class names or device names — purely suffix matching.
+
+    Returns dict of {real_cls: cls_data} or empty dict if no match found.
+    """
+    if cls_name in classes:
+        return {}  # class exists directly, no resolution needed
+
+    resolved = {}
+    for real_cls, cls_data in classes.items():
+        matched_ids = []
+        for nid in cls_data.get("node_ids", []):
+            parts = nid.split("::")
+            if len(parts) < 3:
+                continue
+            inv_method = parts[2]
+            # strip device suffix to get base method name
+            stripped = inv_method
+            for suffix in _DEVICE_SUFFIXES:
+                if inv_method.endswith(suffix):
+                    stripped = inv_method[:-len(suffix)]
+                    break
+            if stripped == method:
+                matched_ids.append(nid)
+
+        if matched_ids:
+            resolved[real_cls] = {
+                "node_ids":   matched_ids,
+                "test_count": len(matched_ids),
+            }
+
+    return resolved
+
+
 def _function_level_select(
     src_file: str,
     symbols_changed: set,
@@ -401,6 +430,8 @@ def _function_level_select(
     or not (file path).
 
     1a method key fix: SGD.step → try SGD if SGD.step not found.
+
+    Mixin resolution: CommonTemplate::test_X → CpuTests::test_X_cpu etc.
     """
     if "__module__" in symbols_changed:
         all_symbols = {
@@ -422,7 +453,7 @@ def _function_level_select(
         key        = f"{src_file}::{sym}"
         graph_vals = function_graph.get(key, [])
 
-        # 1a: method key fix
+        # 1a: method key fix — SGD.step → try SGD
         effective_sym = sym
         if not graph_vals and "." in sym:
             class_name = sym.split(".")[0]
@@ -440,32 +471,46 @@ def _function_level_select(
                 method    = parts[2]
                 node_id   = val
 
-                classes = test_inventory.get(test_file, {})
-                if not classes and cls_name not in (classes or {}):
-                    # method not in inventory — add with single method
-                    if test_file not in selected:
-                        selected[test_file]["triggered_by"]    = [src_file]
-                        selected[test_file]["matched_symbols"].append(effective_sym)
+                classes  = test_inventory.get(test_file, {})
+
+                # resolve CommonTemplate → CpuTests/GPUTests etc.
+                resolved = _resolve_mixin_class(
+                    test_file, cls_name, method, classes
+                )
+
+                if test_file not in selected:
+                    selected[test_file]["triggered_by"]    = [src_file]
+                    selected[test_file]["matched_symbols"].append(effective_sym)
+
+                if resolved:
+                    for real_cls, cls_data in resolved.items():
+                        if real_cls not in selected[test_file]["classes"]:
+                            selected[test_file]["classes"][real_cls] = {
+                                "node_ids":   list(cls_data["node_ids"]),
+                                "test_count": cls_data["test_count"],
+                            }
+                        else:
+                            # accumulate — don't overwrite previous backward variants
+                            existing = selected[test_file]["classes"][real_cls]
+                            new_ids  = [
+                                nid for nid in cls_data["node_ids"]
+                                if nid not in existing["node_ids"]
+                            ]
+                            existing["node_ids"].extend(new_ids)
+                            existing["test_count"] = len(existing["node_ids"])
+                            
+                elif cls_name in classes:
+                    # class exists directly in inventory
+                    selected[test_file]["classes"][cls_name] = classes[cls_name]
+                else:
+                    # not in inventory — use raw node_id as fallback
                     selected[test_file]["classes"][cls_name] = {
                         "node_ids":   [node_id],
                         "test_count": 1,
                     }
-                else:
-                    # add only this specific method from inventory
-                    if test_file not in selected:
-                        selected[test_file]["triggered_by"]    = [src_file]
-                        selected[test_file]["matched_symbols"].append(effective_sym)
-                    if cls_name in (classes or {}):
-                        # use full class from inventory (preserves all node_ids)
-                        selected[test_file]["classes"][cls_name] = classes[cls_name]
-                    else:
-                        selected[test_file]["classes"][cls_name] = {
-                            "node_ids":   [node_id],
-                            "test_count": 1,
-                        }
                 found_any = True
 
-            # schema 2.x: val = "test_file.py" (fallback)
+            # schema 2.x: val = "test_file.py"
             else:
                 test_file = val
                 classes   = test_inventory.get(test_file, {})
@@ -477,10 +522,8 @@ def _function_level_select(
                 selected[test_file]["classes"].update(classes)
 
     if not found_any:
-        # 🔥 NEW: fallback to module-level if symbols not found in graph
         print(f"[WARN] No graph match for symbols in {src_file} → falling back to module-level")
 
-        # collect all symbols from this file
         module_symbols = {
             key.split("::", 1)[1]
             for key in function_graph
@@ -548,12 +591,22 @@ def _reexport_level_select(
                 parts     = val.split("::")
                 test_file = parts[0]
                 cls_name  = parts[1]
+                method    = parts[2]
                 node_id   = val
                 classes   = test_inventory.get(test_file, {})
 
+                # resolve mixin classes here too
+                resolved = _resolve_mixin_class(
+                    test_file, cls_name, method, classes
+                )
+
                 selected[test_file]["triggered_by"]    = [original_trigger]
                 selected[test_file]["matched_symbols"].append(sym)
-                if cls_name in (classes or {}):
+
+                if resolved:
+                    for real_cls, cls_data in resolved.items():
+                        selected[test_file]["classes"][real_cls] = cls_data
+                elif cls_name in (classes or {}):
                     selected[test_file]["classes"][cls_name] = classes[cls_name]
                 else:
                     selected[test_file]["classes"][cls_name] = {
@@ -561,6 +614,7 @@ def _reexport_level_select(
                         "test_count": 1,
                     }
                 found_any = True
+
             else:
                 test_file = val
                 classes   = test_inventory.get(test_file, {})
@@ -614,8 +668,14 @@ def _merge_into_selected(selected_tests: dict, new_selections: dict) -> None:
             selected_tests[test_file]["matched_symbols"] = sorted(set(
                 selected_tests[test_file]["matched_symbols"] + data["matched_symbols"]
             ))
-            selected_tests[test_file]["classes"].update(data["classes"])
-
+            # ← NEW: don't downgrade existing class data
+            # keep whichever has more tests (self-select > function-level)
+            for cls_name, cls_data in data["classes"].items():
+                existing = selected_tests[test_file]["classes"].get(cls_name)
+                if existing is None:
+                    selected_tests[test_file]["classes"][cls_name] = cls_data
+                elif cls_data["test_count"] > existing["test_count"]:
+                    selected_tests[test_file]["classes"][cls_name] = cls_data
 
 def _proximity_fallback(rel: str, test_inventory: dict, dir_mapping: list) -> set:
     if dir_mapping:

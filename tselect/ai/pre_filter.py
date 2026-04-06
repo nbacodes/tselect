@@ -214,6 +214,15 @@ def _build_class_summary(classes: dict, methods: dict) -> str:
         count       = cls_data.get("test_count", 0)
         cls_methods = methods.get(cls_name, [])
 
+        # fallback: use node_ids we already have if source parsing found nothing
+        # this handles dynamically generated classes like CpuTests, GPUTests
+        if not cls_methods:
+            node_ids    = cls_data.get("node_ids", [])
+            cls_methods = [
+                nid.split("::")[-1]
+                for nid in node_ids[:MAX_METHODS_CLASS]
+            ]
+
         if cls_methods:
             method_str = ", ".join(cls_methods)
             if count > MAX_METHODS_CLASS:

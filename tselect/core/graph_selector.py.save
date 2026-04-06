@@ -241,18 +241,6 @@ def select_tests_from_graph(
                 print(f"    Function-level hit: {rel} → skipping transitive expansion")
                 continue  # 🚨 CRITICAL: stop here
 
-            # ← NEW: function lookup empty (e.g. decorator-registered aten ops)
-            # no test imports this function by name directly
-            # fall back to file-level — much better than BFS explosion
-            print(f"    [INFO] No function-level match for {rel} → file-level fallback")
-            file_level_tests = set(reverse_graph.get(rel, []))
-            if file_level_tests:
-                _add_file_level_tests(
-                    selected_tests, file_level_tests, test_inventory,
-                    trigger=rel, mode="file"
-                )
-                continue
-
         elif symbols_changed in (set(), {"__unknown__"}):
             print(f"[WARN] No usable diff symbols for {rel} → skipping function-level")
 

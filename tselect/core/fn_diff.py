@@ -92,6 +92,217 @@ def get_all_identifiers(file_path: Path) -> set[str]:
     return set()
 
 
+def get_dunder_all(file_path: Path) -> Optional[set[str]]:
+    """
+    Feature 6: Parse __all__ from a .py file.
+
+    Returns the explicit export list if defined, or None if not present.
+    Used by graph_builder to resolve star imports precisely:
+        "from torch.optim import *"  →  exactly {"SGD", "Adam", "RMSprop"}
+    instead of dumping every symbol in the file.
+
+    Examples:
+        __all__ = ["SGD", "Adam"]          → {"SGD", "Adam"}
+        __all__ = ["SGD"] + ["Adam"]       → None (dynamic, can't resolve)
+        (no __all__)                       → None (caller uses get_all_symbols)
+    """
+    if file_path.suffix.lower() not in PY_EXTENSIONS:
+        return None
+
+    parser = _get_parser('python')
+    if not parser:
+        return _ast_dunder_all(file_path)
+
+    try:
+        source_bytes = file_path.read_bytes()
+        tree = parser.parse(source_bytes)
+    except Exception:
+        return _ast_dunder_all(file_path)
+
+    # walk top-level statements only — __all__ is always module-level
+    for node in tree.root_node.children:
+        if node.type != 'expression_statement':
+            continue
+        # look for assignment: __all__ = [...]
+        for child in node.children:
+            if child.type != 'assignment':
+                continue
+            targets = [c for c in child.children if c.type == 'identifier']
+            if not targets or targets[0].text.decode() != '__all__':
+                continue
+            # find the list node
+            for val in child.children:
+                if val.type == 'list':
+                    names = set()
+                    for item in val.children:
+                        if item.type == 'string':
+                            # strip quotes
+                            raw = item.text.decode('utf-8', errors='ignore')
+                            name = raw.strip('"\'')
+                            if name:
+                                names.add(name)
+                    return names if names else None
+    return None
+
+
+def get_decorator_registry(file_path: Path) -> dict[str, str]:
+    """
+    Feature 8: Extract decorator → function mappings from a .py file.
+
+    Finds patterns like:
+        @register_lowering(aten.add)
+        def add_lowering(x, y): ...
+
+        @register_op("mul")
+        def mul_op(...): ...
+
+    Returns:
+        {
+            "aten.add":  "add_lowering",
+            "mul":       "mul_op",
+        }
+
+    Used by graph_builder to resolve decorator-wrapped registries.
+    When a test calls aten.add, we now know it calls add_lowering.
+    """
+    if file_path.suffix.lower() not in PY_EXTENSIONS:
+        return {}
+
+    parser = _get_parser('python')
+    if not parser:
+        return _ast_decorator_registry(file_path)
+
+    try:
+        source_bytes = file_path.read_bytes()
+        tree = parser.parse(source_bytes)
+    except Exception:
+        return _ast_decorator_registry(file_path)
+
+    registry = {}
+
+    def _walk(node):
+        if node.type == 'decorated_definition':
+            fn_name   = None
+            dec_args  = []
+
+            for child in node.children:
+                # get the function name
+                if child.type in ('function_definition', 'async_function_definition'):
+                    fn_name = _py_name(child)
+
+                # get decorator arguments
+                elif child.type == 'decorator':
+                    for dec_child in child.children:
+                        if dec_child.type == 'call':
+                            # extract all arguments as strings
+                            for arg in dec_child.children:
+                                if arg.type == 'argument_list':
+                                    for a in arg.children:
+                                        text = a.text.decode('utf-8', errors='ignore').strip()
+                                        if text and text not in (',', '(', ')'):
+                                            dec_args.append(text)
+
+            if fn_name and dec_args:
+                for arg in dec_args:
+                    registry[arg] = fn_name
+
+        for child in node.children:
+            _walk(child)
+
+    _walk(tree.root_node)
+    return registry
+
+
+def classify_change(file_path: Path, changed_lines: set[int]) -> dict[str, str]:
+    """
+    Feature 13: Classify what KIND of change happened per function.
+
+    Instead of just knowing WHICH function changed, know HOW it changed:
+        "signature"    — parameter list or return annotation modified
+                         → callers may be broken, consider coverage rebuild
+        "body"         — only internal logic changed, same interface
+                         → callers unaffected, coverage map still valid
+        "new_function" — function didn't exist before (all lines are new)
+                         → not in coverage map, BFS fallback
+        "deleted"      — function was removed (no lines in new file)
+                         → find all callers, definitely run their tests
+
+    Returns:
+        {
+            "SGD.step":        "body",
+            "SGD.__init__":    "signature",
+            "new_helper":      "new_function",
+        }
+    """
+    if file_path.suffix.lower() not in PY_EXTENSIONS:
+        return {sym: "body" for sym in extract_symbols_at_lines(file_path, changed_lines)}
+
+    parser = _get_parser('python')
+    if not parser:
+        return {sym: "body" for sym in extract_symbols_at_lines(file_path, changed_lines)}
+
+    try:
+        source_bytes = file_path.read_bytes()
+        tree = parser.parse(source_bytes)
+    except Exception:
+        return {}
+
+    definitions = _collect_definitions(tree.root_node, 'python')
+    result = {}
+
+    for start, end, name in definitions:
+        lines_in_fn = {l for l in changed_lines if start <= l <= end}
+        if not lines_in_fn:
+            continue
+
+        # find the function node to get signature line range
+        sig_lines = _get_signature_lines(tree.root_node, name)
+
+        if sig_lines and (lines_in_fn & sig_lines):
+            result[name] = "signature"
+        else:
+            result[name] = "body"
+
+    # new_function: changed lines not covered by any definition
+    covered = {l for start, end, _ in definitions for l in changed_lines if start <= l <= end}
+    if changed_lines - covered:
+        result["__module__"] = "new_function"
+
+    return result
+
+
+def get_call_sites(file_path: Path) -> dict[str, set[str]]:
+    """
+    Feature 14: Extract what each function/method actually CALLS.
+
+    Returns:
+        {
+            "TestOptimCPU.test_sgd_momentum": {"SGD", "step", "zero_grad"},
+            "TestOptimCPU.test_adam":         {"Adam", "step"},
+        }
+
+    This is stronger than import analysis — a test file may import SGD
+    but only test_sgd_momentum actually CALLS it. test_adam never does.
+
+    Used by graph_builder._extract_method_level_references() to get
+    precise per-method symbol usage instead of file-level import tracking.
+    """
+    if file_path.suffix.lower() not in PY_EXTENSIONS:
+        return {}
+
+    parser = _get_parser('python')
+    if not parser:
+        return _ast_call_sites(file_path)
+
+    try:
+        source_bytes = file_path.read_bytes()
+        tree = parser.parse(source_bytes)
+    except Exception:
+        return _ast_call_sites(file_path)
+
+    return _ts_call_sites(tree.root_node)
+
+
 def extract_symbols_at_lines(file_path: Path, changed_lines: set[int]) -> set[str]:
     """
     Return the set of function/class names that contain any of the changed lines.
@@ -334,6 +545,268 @@ def _cpp_name_from_declarator_chain(node) -> Optional[str]:
 def _node_lines(node) -> tuple[int, int]:
     """Return (start_line, end_line) as 1-based integers."""
     return node.start_point[0] + 1, node.end_point[0] + 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature 6: __all__ helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ast_dunder_all(file_path: Path) -> Optional[set[str]]:
+    """ast fallback for __all__ parsing."""
+    try:
+        source = file_path.read_text(encoding='utf-8', errors='ignore')
+        tree   = ast.parse(source)
+    except Exception:
+        return None
+
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == '__all__':
+                if isinstance(node.value, (ast.List, ast.Tuple)):
+                    names = set()
+                    for elt in node.value.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            names.add(elt.value)
+                    return names if names else None
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature 7: TYPE_CHECKING guard detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_type_checking_block(node) -> bool:
+    """
+    Return True if a tree-sitter if_statement node is:
+        if TYPE_CHECKING:
+        if typing.TYPE_CHECKING:
+
+    Used to skip imports inside these blocks — they're type-hint-only
+    and never execute at runtime, so they create false positive graph edges.
+    """
+    for child in node.children:
+        if child.type in ('identifier', 'attribute'):
+            text = child.text.decode('utf-8', errors='ignore')
+            if 'TYPE_CHECKING' in text:
+                return True
+    return False
+
+
+def is_runtime_import(import_node, parent_chain: list) -> bool:
+    """
+    Feature 7 public helper: return False if the import is inside
+    a TYPE_CHECKING block (meaning it's type-hint-only, not runtime).
+
+    parent_chain: list of ancestor node types from tree-sitter walk.
+
+    Usage in graph_builder: skip imports where this returns False.
+    """
+    for ancestor_type in parent_chain:
+        if ancestor_type == 'if_statement':
+            return False  # conservative — caller checks _is_type_checking_block
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature 8: decorator registry helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ast_decorator_registry(file_path: Path) -> dict[str, str]:
+    """ast fallback for decorator registry extraction."""
+    registry = {}
+    try:
+        source = file_path.read_text(encoding='utf-8', errors='ignore')
+        tree   = ast.parse(source)
+    except Exception:
+        return registry
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.decorator_list:
+            continue
+
+        fn_name = node.name
+        for dec in node.decorator_list:
+            # @register_lowering(aten.add)  → Call node
+            if isinstance(dec, ast.Call):
+                for arg in dec.args:
+                    # aten.add → Attribute node
+                    if isinstance(arg, ast.Attribute):
+                        key = f"{_ast_dotted(arg.value)}.{arg.attr}"
+                        registry[key] = fn_name
+                    elif isinstance(arg, ast.Name):
+                        registry[arg.id] = fn_name
+                    elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        registry[arg.value] = fn_name
+    return registry
+
+
+def _ast_dotted(node) -> str:
+    """Reconstruct dotted name from ast.Attribute chain."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_ast_dotted(node.value)}.{node.attr}"
+    return "?"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature 13: signature line detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_signature_lines(root_node, qualified_name: str) -> Optional[set[int]]:
+    """
+    Find the 1-based line numbers of just the signature of a function
+    (from 'def' to the closing ')' of the parameter list, inclusive).
+
+    Returns None if the function isn't found.
+    """
+    parts = qualified_name.split('.')
+
+    def _find(node, depth: int, parent: str) -> Optional[set[int]]:
+        target = parts[depth]
+
+        for child in node.children:
+            if child.type == 'class_definition':
+                name = _py_name(child)
+                if name == target and depth < len(parts) - 1:
+                    body = next((c for c in child.children if c.type == 'block'), None)
+                    if body:
+                        result = _find(body, depth + 1, name)
+                        if result:
+                            return result
+
+            elif child.type in ('function_definition', 'async_function_definition'):
+                name = _py_name(child)
+                if name == target and depth == len(parts) - 1:
+                    # signature = from start of node to end of parameters
+                    params = next(
+                        (c for c in child.children if c.type == 'parameters'), None
+                    )
+                    if params:
+                        start = child.start_point[0] + 1
+                        end   = params.end_point[0] + 1
+                        return set(range(start, end + 1))
+
+            elif child.type == 'decorated_definition':
+                result = _find(child, depth, parent)
+                if result:
+                    return result
+
+            elif child.type == 'block':
+                result = _find(child, depth, parent)
+                if result:
+                    return result
+
+        return None
+
+    return _find(root_node, 0, '')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature 14: call site extraction helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ts_call_sites(root_node) -> dict[str, set[str]]:
+    """
+    tree-sitter: extract what each class method CALLS.
+
+    Returns:
+        {
+            "TestOptimCPU.test_sgd_momentum": {"SGD", "step", "zero_grad"},
+        }
+
+    Collects:
+        - Direct calls:      SGD(...)           → "SGD"
+        - Attribute calls:   opt.step()         → "step"
+        - Chained calls:     torch.optim.SGD()  → "SGD"
+    """
+    result = {}
+
+    def _collect_calls(node) -> set[str]:
+        calls = set()
+        if node.type == 'call':
+            fn = node.children[0] if node.children else None
+            if fn:
+                if fn.type == 'identifier':
+                    calls.add(fn.text.decode('utf-8', errors='ignore'))
+                elif fn.type == 'attribute':
+                    # obj.method — collect the attribute name
+                    for c in fn.children:
+                        if c.type == 'identifier':
+                            calls.add(c.text.decode('utf-8', errors='ignore'))
+        for child in node.children:
+            calls |= _collect_calls(child)
+        return calls
+
+    def _walk_class(class_node, class_name: str):
+        for child in class_node.children:
+            if child.type == 'block':
+                for item in child.children:
+                    fn_node = item
+                    # handle decorated methods
+                    if item.type == 'decorated_definition':
+                        for c in item.children:
+                            if c.type in ('function_definition', 'async_function_definition'):
+                                fn_node = c
+                                break
+
+                    if fn_node.type in ('function_definition', 'async_function_definition'):
+                        fn_name = _py_name(fn_node)
+                        if fn_name:
+                            body = next(
+                                (c for c in fn_node.children if c.type == 'block'), None
+                            )
+                            if body:
+                                key = f"{class_name}.{fn_name}"
+                                result[key] = _collect_calls(body)
+
+    for node in root_node.children:
+        if node.type == 'class_definition':
+            class_name = _py_name(node)
+            if class_name:
+                _walk_class(node, class_name)
+        elif node.type == 'decorated_definition':
+            for child in node.children:
+                if child.type == 'class_definition':
+                    class_name = _py_name(child)
+                    if class_name:
+                        _walk_class(child, class_name)
+
+    return result
+
+
+def _ast_call_sites(file_path: Path) -> dict[str, set[str]]:
+    """ast fallback for call site extraction."""
+    result = {}
+    try:
+        source = file_path.read_text(encoding='utf-8', errors='ignore')
+        tree   = ast.parse(source)
+    except Exception:
+        return result
+
+    for class_node in ast.walk(tree):
+        if not isinstance(class_node, ast.ClassDef):
+            continue
+        for method in class_node.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            calls = set()
+            for node in ast.walk(method):
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        calls.add(node.func.id)
+                    elif isinstance(node.func, ast.Attribute):
+                        calls.add(node.func.attr)
+                        if isinstance(node.func.value, ast.Name):
+                            calls.add(node.func.value.id)
+            key = f"{class_node.name}.{method.name}"
+            result[key] = calls
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

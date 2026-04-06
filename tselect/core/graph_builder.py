@@ -350,20 +350,23 @@ class GraphBuilder:
     # ─────────────────────────────────────────────
 
     def _extract_method_level_references(
-        self, test_path: Path, module_map: dict, call_sites: dict = None
+        self, test_path: Path, module_map: dict,
+        call_sites: dict = None, decorator_registry: dict = None
     ) -> dict:
         """
         Parse a test file and return which symbols each TEST METHOD references.
 
-        Now uses call_sites (feature 14) for precision:
-          - call_sites tells us what each method ACTUALLY CALLS
-          - we intersect that with imported symbols
-          - result: only methods that genuinely call the changed symbol
+        Path A — direct import intersection (existing):
+            method imports SGD AND calls SGD → edge
 
-        Falls back to import-level analysis if call_sites not provided.
+        Path B — decorator registry matching (feature 15, NEW):
+            method calls "torch.ops.aten.max_pool2d_with_indices_backward"
+            suffix "aten.max_pool2d_with_indices_backward" matches decorator_registry
+            → edge: lowering.py::max_pool2d_with_indices_backward → this method
         """
         method_references = {}
-        call_sites = call_sites or {}
+        call_sites        = call_sites or {}
+        decorator_registry = decorator_registry or {}
 
         try:
             source = test_path.read_text(encoding="utf-8", errors="ignore")
@@ -407,10 +410,7 @@ class GraphBuilder:
                         local = alias.asname or alias.name.split(".")[-1]
                         alias_map[local] = (src_file, None)
 
-        if not alias_map:
-            return method_references
-
-        # step 2: per-method symbol walk — intersect with call_sites if available
+        # step 2: per-method symbol walk
         for class_node in ast.walk(tree):
             if not isinstance(class_node, ast.ClassDef):
                 continue
@@ -421,29 +421,41 @@ class GraphBuilder:
                 if not method_node.name.startswith("test_"):
                     continue
 
-                method_key  = f"{class_node.name}::{method_node.name}"
-                cs_key      = f"{class_node.name}.{method_node.name}"
-                actual_calls = call_sites.get(cs_key)  # feature 14
+                method_key   = f"{class_node.name}::{method_node.name}"
+                cs_key       = f"{class_node.name}.{method_node.name}"
+                actual_calls = call_sites.get(cs_key)
                 refs         = defaultdict(set)
 
-                for node in ast.walk(method_node):
-                    if isinstance(node, ast.Name):
-                        name = node.id
-                        if name in alias_map:
-                            # feature 14: only if this name is actually called
-                            if actual_calls is None or name in actual_calls:
-                                src_file, sym = alias_map[name]
-                                refs[src_file].add(sym or name)
+                # Path A: direct import intersection
+                if alias_map:
+                    for node in ast.walk(method_node):
+                        if isinstance(node, ast.Name):
+                            name = node.id
+                            if name in alias_map:
+                                if actual_calls is None or name in actual_calls:
+                                    src_file, sym = alias_map[name]
+                                    refs[src_file].add(sym or name)
 
-                    elif isinstance(node, ast.Attribute):
-                        attr = node.attr
-                        if isinstance(node.value, ast.Name):
-                            obj = node.value.id
-                            if obj in alias_map:
-                                # feature 14: only if attr is actually called
-                                if actual_calls is None or attr in actual_calls:
-                                    src_file, _ = alias_map[obj]
-                                    refs[src_file].add(attr)
+                        elif isinstance(node, ast.Attribute):
+                            attr = node.attr
+                            if isinstance(node.value, ast.Name):
+                                obj = node.value.id
+                                if obj in alias_map:
+                                    if actual_calls is None or attr in actual_calls:
+                                        src_file, _ = alias_map[obj]
+                                        refs[src_file].add(attr)
+
+                # Path B: decorator registry matching (feature 15)
+                # check all call chains in this method against decorator_registry
+                if decorator_registry and actual_calls:
+                    for chain in actual_calls:
+                        # chain could be "aten.add", "ops.aten.add", etc.
+                        if chain in decorator_registry:
+                            # decorator_registry value is "source_file::fn_name"
+                            mapped = decorator_registry[chain]
+                            if '::' in mapped:
+                                src_file, fn_name = mapped.split('::', 1)
+                                refs[src_file].add(fn_name)
 
                 if refs:
                     method_references[method_key] = dict(refs)
@@ -491,10 +503,10 @@ class GraphBuilder:
             for src_file in file_refs:
                 file_reverse[src_file].add(rel_test)
 
-            # feature 14: use call sites for precise method-level references
-            call_sites  = get_call_sites(test)   # {"TestClass.test_method": {"SGD", "step"}}
+            # feature 14+15: use call sites + decorator registry for precise edges
+            call_sites  = get_call_sites(test)
             method_refs = self._extract_method_level_references(
-                test, module_map, call_sites
+                test, module_map, call_sites, decorator_registry
             )
             for method_key, src_refs in method_refs.items():
                 full_method_id = f"{rel_test}::{method_key}"
@@ -502,12 +514,6 @@ class GraphBuilder:
                     for sym in symbols:
                         key = f"{src_file}::{sym}"
                         function_reverse[key].add(full_method_id)
-                        # feature 8: also index by decorator arg
-                        # e.g. "aten.add" → add_lowering → index test under aten.add too
-                        dec_key = f"{src_file}::{sym}"
-                        if dec_key in decorator_registry:
-                            mapped = decorator_registry[dec_key]
-                            function_reverse[mapped].add(full_method_id)
 
             if (idx + 1) % 100 == 0:
                 print(f"    [{idx+1}/{total} test files processed]")

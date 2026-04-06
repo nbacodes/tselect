@@ -716,13 +716,20 @@ def _ts_call_sites(root_node) -> dict[str, set[str]]:
 
     Returns:
         {
-            "TestOptimCPU.test_sgd_momentum": {"SGD", "step", "zero_grad"},
+            "TestOptimCPU.test_sgd_momentum": {
+                "SGD",
+                "step",
+                "torch.ops.aten.max_pool2d_with_indices_backward",
+                "ops.aten.max_pool2d_with_indices_backward",
+                "aten.max_pool2d_with_indices_backward",
+            },
         }
 
     Collects:
-        - Direct calls:      SGD(...)           → "SGD"
-        - Attribute calls:   opt.step()         → "step"
-        - Chained calls:     torch.optim.SGD()  → "SGD"
+        - Direct calls:   SGD(...)              → "SGD"
+        - Attribute:      opt.step()            → "step"
+        - Full chains:    torch.ops.aten.add()  → all suffixes of the chain
+                          so decorator registry can match "aten.add"
     """
     result = {}
 
@@ -734,10 +741,22 @@ def _ts_call_sites(root_node) -> dict[str, set[str]]:
                 if fn.type == 'identifier':
                     calls.add(fn.text.decode('utf-8', errors='ignore'))
                 elif fn.type == 'attribute':
-                    # obj.method — collect the attribute name
+                    # collect individual identifiers
                     for c in fn.children:
                         if c.type == 'identifier':
                             calls.add(c.text.decode('utf-8', errors='ignore'))
+                    # also collect full dotted chain + ALL suffixes
+                    # torch.ops.aten.add → also "ops.aten.add", "aten.add"
+                    # so decorator_registry["aten.add"] can match
+                    try:
+                        full  = fn.text.decode('utf-8', errors='ignore')
+                        parts = full.split('.')
+                        for i in range(len(parts) - 1):  # min 2 parts
+                            suffix = '.'.join(parts[i:])
+                            if suffix:
+                                calls.add(suffix)
+                    except Exception:
+                        pass
         for child in node.children:
             calls |= _collect_calls(child)
         return calls
@@ -780,13 +799,22 @@ def _ts_call_sites(root_node) -> dict[str, set[str]]:
 
 
 def _ast_call_sites(file_path: Path) -> dict[str, set[str]]:
-    """ast fallback for call site extraction."""
+    """ast fallback for call site extraction — also extracts full dotted chains."""
     result = {}
     try:
         source = file_path.read_text(encoding='utf-8', errors='ignore')
         tree   = ast.parse(source)
     except Exception:
         return result
+
+    def _dotted(node) -> Optional[str]:
+        """Reconstruct full dotted name from ast.Attribute chain."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            val = _dotted(node.value)
+            return f"{val}.{node.attr}" if val else node.attr
+        return None
 
     for class_node in ast.walk(tree):
         if not isinstance(class_node, ast.ClassDef):
@@ -803,6 +831,12 @@ def _ast_call_sites(file_path: Path) -> dict[str, set[str]]:
                         calls.add(node.func.attr)
                         if isinstance(node.func.value, ast.Name):
                             calls.add(node.func.value.id)
+                        # full dotted chain + all suffixes
+                        full = _dotted(node.func)
+                        if full:
+                            parts = full.split('.')
+                            for i in range(len(parts) - 1):  # min 2 parts
+                                calls.add('.'.join(parts[i:]))
             key = f"{class_node.name}.{method.name}"
             result[key] = calls
 

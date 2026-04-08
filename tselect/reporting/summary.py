@@ -6,8 +6,7 @@ def _short_reason(reason: str, max_len: int = 60) -> str:
 
 
 def _build_audit(ai_decisions: list) -> dict:
-    correct_keeps   = []
-    correct_removes = []
+    correct_keeps   = []œ
     safety_keeps    = []
     contradictions  = []
 

@@ -44,14 +44,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from tselect.core.fn_diff import (
-    get_all_symbols,
-    get_all_identifiers,
-    get_dunder_all,
-    get_decorator_registry,
-    get_call_sites,
-    classify_change,
-)
+from tselect.core.fn_diff import get_all_symbols, get_all_identifiers
 
 SUPPORTED_LANGUAGES   = {"python"}
 COMING_SOON_LANGUAGES = {"java", "javascript", "typescript", "go", "cpp"}
@@ -300,11 +293,8 @@ class GraphBuilder:
                     for alias in node.names:
                         if alias.name == "*":
                             src_path = self.repo_root / src_file
-                            # feature 6: use __all__ if defined, else all symbols
-                            explicit = get_dunder_all(src_path)
                             references[src_file].update(
-                                explicit if explicit is not None
-                                else self._extract_public_symbols(src_path)
+                                self._extract_public_symbols(src_path)
                             )
                         else:
                             references[src_file].add(alias.name)
@@ -350,23 +340,22 @@ class GraphBuilder:
     # ─────────────────────────────────────────────
 
     def _extract_method_level_references(
-        self, test_path: Path, module_map: dict,
-        call_sites: dict = None, decorator_registry: dict = None
+        self, test_path: Path, module_map: dict
     ) -> dict:
         """
         Parse a test file and return which symbols each TEST METHOD references.
 
-        Path A — direct import intersection (existing):
-            method imports SGD AND calls SGD → edge
+        Returns:
+            {
+                "TestOptimCPU::test_sgd_momentum": {
+                    "torch/optim/sgd.py": {"SGD", "step"},
+                },
+            }
 
-        Path B — decorator registry matching (feature 15, NEW):
-            method calls "torch.ops.aten.max_pool2d_with_indices_backward"
-            suffix "aten.max_pool2d_with_indices_backward" matches decorator_registry
-            → edge: lowering.py::max_pool2d_with_indices_backward → this method
+        This enables function_reverse_graph to map:
+            "sgd.py::SGD" → ["test_optim.py::TestOptimCPU::test_sgd_momentum"]
         """
         method_references = {}
-        call_sites        = call_sites or {}
-        decorator_registry = decorator_registry or {}
 
         try:
             source = test_path.read_text(encoding="utf-8", errors="ignore")
@@ -374,19 +363,11 @@ class GraphBuilder:
         except Exception:
             return method_references
 
-        # step 1: file-level alias map + feature 7: skip TYPE_CHECKING imports
+        # step 1: file-level alias map
         alias_map    = {}
         file_symbols = defaultdict(set)
 
         for node in ast.walk(tree):
-            # feature 7: skip TYPE_CHECKING blocks
-            if isinstance(node, ast.If):
-                test_val = node.test
-                if isinstance(test_val, ast.Name) and test_val.id == 'TYPE_CHECKING':
-                    continue
-                if isinstance(test_val, ast.Attribute) and test_val.attr == 'TYPE_CHECKING':
-                    continue
-
             if isinstance(node, ast.ImportFrom) and node.module:
                 src_file = module_map.get(node.module)
                 if src_file:
@@ -410,6 +391,9 @@ class GraphBuilder:
                         local = alias.asname or alias.name.split(".")[-1]
                         alias_map[local] = (src_file, None)
 
+        if not alias_map:
+            return method_references
+
         # step 2: per-method symbol walk
         for class_node in ast.walk(tree):
             if not isinstance(class_node, ast.ClassDef):
@@ -421,41 +405,23 @@ class GraphBuilder:
                 if not method_node.name.startswith("test_"):
                     continue
 
-                method_key   = f"{class_node.name}::{method_node.name}"
-                cs_key       = f"{class_node.name}.{method_node.name}"
-                actual_calls = call_sites.get(cs_key)
-                refs         = defaultdict(set)
+                method_key = f"{class_node.name}::{method_node.name}"
+                refs       = defaultdict(set)
 
-                # Path A: direct import intersection
-                if alias_map:
-                    for node in ast.walk(method_node):
-                        if isinstance(node, ast.Name):
-                            name = node.id
-                            if name in alias_map:
-                                if actual_calls is None or name in actual_calls:
-                                    src_file, sym = alias_map[name]
-                                    refs[src_file].add(sym or name)
+                for node in ast.walk(method_node):
+                    if isinstance(node, ast.Name):
+                        name = node.id
+                        if name in alias_map:
+                            src_file, sym = alias_map[name]
+                            refs[src_file].add(sym or name)
 
-                        elif isinstance(node, ast.Attribute):
-                            attr = node.attr
-                            if isinstance(node.value, ast.Name):
-                                obj = node.value.id
-                                if obj in alias_map:
-                                    if actual_calls is None or attr in actual_calls:
-                                        src_file, _ = alias_map[obj]
-                                        refs[src_file].add(attr)
-
-                # Path B: decorator registry matching (feature 15)
-                # check all call chains in this method against decorator_registry
-                if decorator_registry and actual_calls:
-                    for chain in actual_calls:
-                        # chain could be "aten.add", "ops.aten.add", etc.
-                        if chain in decorator_registry:
-                            # decorator_registry value is "source_file::fn_name"
-                            mapped = decorator_registry[chain]
-                            if '::' in mapped:
-                                src_file, fn_name = mapped.split('::', 1)
-                                refs[src_file].add(fn_name)
+                    elif isinstance(node, ast.Attribute):
+                        attr = node.attr
+                        if isinstance(node.value, ast.Name):
+                            obj = node.value.id
+                            if obj in alias_map:
+                                src_file, _ = alias_map[obj]
+                                refs[src_file].add(attr)
 
                 if refs:
                     method_references[method_key] = dict(refs)
@@ -484,16 +450,6 @@ class GraphBuilder:
         file_reverse     = defaultdict(set)
         function_reverse = defaultdict(set)
         file_identifiers = {}
-        decorator_registry = {}  # feature 8: arg → function name across all source files
-
-        # feature 8: build decorator registry from all source files first
-        print("  Building decorator registry (tree-sitter) ...")
-        for src in self.source_files:
-            rel = str(src.relative_to(self.repo_root))
-            reg = get_decorator_registry(src)
-            for arg, fn_name in reg.items():
-                # store as "source_file::fn_name" so graph_selector can look it up
-                decorator_registry[arg] = f"{rel}::{fn_name}"
 
         total = len(self.test_files)
         for idx, test in enumerate(self.test_files):
@@ -503,11 +459,7 @@ class GraphBuilder:
             for src_file in file_refs:
                 file_reverse[src_file].add(rel_test)
 
-            # feature 14+15: use call sites + decorator registry for precise edges
-            call_sites  = get_call_sites(test)
-            method_refs = self._extract_method_level_references(
-                test, module_map, call_sites, decorator_registry
-            )
+            method_refs = self._extract_method_level_references(test, module_map)
             for method_key, src_refs in method_refs.items():
                 full_method_id = f"{rel_test}::{method_key}"
                 for src_file, symbols in src_refs.items():
@@ -530,7 +482,6 @@ class GraphBuilder:
             {k: sorted(v) for k, v in file_reverse.items()},
             {k: sorted(v) for k, v in function_reverse.items()},
             file_identifiers,
-            decorator_registry,
         )
 
     # ─────────────────────────────────────────────
@@ -668,7 +619,7 @@ class GraphBuilder:
         # Phase 1: test → source reverse graphs + file identifiers (tree-sitter)
         print("  Phase 1: Building file + function graph + identifier index (tree-sitter)...")
         t1 = time.time()
-        file_reverse, function_reverse, file_identifiers, decorator_registry = self._build_reverse_graphs(module_map)
+        file_reverse, function_reverse, file_identifiers = self._build_reverse_graphs(module_map)
 
         elapsed1      = time.time() - t1
         total_f_edges = sum(len(v) for v in file_reverse.values())
@@ -701,13 +652,12 @@ class GraphBuilder:
               f"(computed from distribution gap)")
 
         return {
-            "schema_version":         "3.2",
+            "schema_version":         "3.1",
             "language":               self.language,
             "source_reverse_graph":   source_reverse_graph,
             "full_reverse_graph":     file_reverse,
             "function_reverse_graph": function_reverse,
             "file_identifiers":       file_identifiers,
-            "decorator_registry":     decorator_registry,
             "fanout_threshold":       fanout_threshold,
             "test_inventory":         test_inventory,
             "built_at":               time.time(),

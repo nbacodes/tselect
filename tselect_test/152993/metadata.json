@@ -1,0 +1,18 @@
+{
+  "pr": "152993",
+  "desc": "Fix ModularIndexing assumptions",
+  "category": "bug-fix",
+  "changed_files": [
+    "test/inductor/test_indexing.py",
+    "torch/utils/_sympy/functions.py"
+  ],
+  "selected_count": 9,
+  "total_methods_traversed": 1634,
+  "error": null,
+  "config": {
+    "graph": {
+      "fanout_threshold": 30,
+      "transitive_depth": 1
+    }
+  }
+}

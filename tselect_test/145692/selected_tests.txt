@@ -1,0 +1,15 @@
+test/higher_order_ops/test_inline_asm_elementwise.py
+test/inductor/test_codegen_triton.py
+test/inductor/test_fxir_backend.py
+test/inductor/test_gpu_cpp_wrapper.py
+test/inductor/test_indexing.py
+test/inductor/test_inductor_scheduler.py
+test/inductor/test_loop_ordering.py
+test/inductor/test_max_autotune.py
+test/inductor/test_memory.py
+test/inductor/test_mix_order_reduction.py
+test/inductor/test_op_completeness.py
+test/inductor/test_select_algorithm.py
+test/inductor/test_torchinductor.py
+test/inductor/test_torchinductor_strided_blocks.py
+test/inductor/test_triton_extension_backend.py

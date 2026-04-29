@@ -1,0 +1,6 @@
+PR: #152993
+Description: Fix ModularIndexing assumptions
+Category: bug-fix
+Changed files (from diff): 2
+Selected tests (tselect): 0
+0

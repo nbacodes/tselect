@@ -1,0 +1,20 @@
+{
+  "pr": "181700",
+  "desc": "TMA load in fused pointwise epilogues",
+  "category": "gpu-codegen",
+  "changed_files": [
+    "test/inductor/test_max_autotune_blackwell.py",
+    "torch/_inductor/codegen/triton.py",
+    "torch/_inductor/config.py",
+    "torch/_inductor/select_algorithm.py"
+  ],
+  "selected_count": 70,
+  "total_methods_traversed": 7774,
+  "error": null,
+  "config": {
+    "graph": {
+      "fanout_threshold": 30,
+      "transitive_depth": 1
+    }
+  }
+}

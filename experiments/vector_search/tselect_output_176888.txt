@@ -1,0 +1,62 @@
+[[32mINFO[0m] Starting selective test run
+
+============================================================
+  tselect — Targeted Test Selection
+============================================================
+[[32mINFO[0m] Auto-detecting changed files via git diff
+
+  Changed files (git diff):
+    • test/inductor/pallas_expected_failures/CpuTests.test_max_pool2d_with_indices_backward6_cpu
+    • test/inductor/test_torchinductor.py
+    • test/inductor/test_torchinductor_codegen_dynamic_shapes.py
+    • torch/_inductor/lowering.py
+[[32mINFO[0m] Using auto-built dependency graph
+[WARN] No changed lines detected for test/inductor/test_torchinductor_codegen_dynamic_shapes.py
+    Self-select: test/inductor/test_torchinductor.py (test file changed directly)
+    Self-select: test/inductor/test_torchinductor_codegen_dynamic_shapes.py (test file changed directly)
+    Function-level hit: torch/_inductor/lowering.py → skipping transitive expansion
+
+    Skipping non-code file: test/inductor/pallas_expected_failures/CpuTests.test_max_pool2d_with_indices_backward6_cpu
+  Selection mode: 1 via function  |  2 via self
+[WARN] No changed lines detected for test/inductor/test_torchinductor_codegen_dynamic_shapes.py
+
+  🤖 AI pre-filtering 3 candidate test files...
+  🔒 test/inductor/test_torchinductor.py
+     protected (PR directly modified this file)
+  🔒 test/inductor/test_torchinductor_codegen_dynamic_shapes.py
+     protected (PR directly modified this file)
+  ❌ test/nn/test_pooling.py
+     removed (confidence: 0.80)
+     "The test classes do not directly test the changed symbols related to max_pool2d_with_indices_backward."
+
+  AI removed 1 test file(s)
+
+  ────────────────────────────────────────────────────────
+  Selected: 2 test files, 6 classes, 2988 test methods
+  ────────────────────────────────────────────────────────
+
+  📄 test/inductor/test_torchinductor.py
+     ← test/inductor/test_torchinductor.py, torch/_inductor/lowering.py
+     • SweepInputsCpuTest (64 tests)
+     • CpuTests (953 tests)
+     • SweepInputsGPUTest (64 tests)
+     • GPUTests (953 tests)
+     • TestFull (1 tests)
+
+  📄 test/inductor/test_torchinductor_codegen_dynamic_shapes.py
+     ← test/inductor/test_torchinductor_codegen_dynamic_shapes.py
+     • DynamicShapesCodegenCpuTests (953 tests)
+
+  ────────────────────────────────────────────────────────
+  PYTEST COMMAND
+  ────────────────────────────────────────────────────────
+
+  pytest \
+    test/inductor/test_torchinductor.py::CpuTests::test_AllenaiLongformerBase_repro_cpu \
+    test/inductor/test_torchinductor.py::CpuTests::test__dyn_quant_matmul_4bit_bf16_input_cpu \
+    test/inductor/test_torchinductor.py::CpuTests::test__dyn_quant_matmul_4bit_fp32_input_cpu \
+    test/inductor/test_torchinductor.py::CpuTests::test__dyn_quant_pack_4bit_weight_bf16_cpu \
+    test/inductor/test_torchinductor.py::CpuTests::test__dyn_quant_pack_4bit_weight_fp32_cpu \
+    ... and 2983 more
+
+  To execute: tselect run --execute

@@ -1,0 +1,16 @@
+test/inductor/extension_backends/cpp/extension_codegen_backend.py
+test/inductor/extension_backends/triton/extension_codegen_backend.py
+torch/_inductor/codegen/common.py
+torch/_inductor/codegen/cpp.py
+torch/_inductor/codegen/cpp_wrapper_cpu.py
+torch/_inductor/codegen/cpp_wrapper_cpu_array_ref.py
+torch/_inductor/codegen/cpp_wrapper_gpu.py
+torch/_inductor/codegen/cuda/cuda_cpp_scheduling.py
+torch/_inductor/codegen/cuda_combined_scheduling.py
+torch/_inductor/codegen/mps.py
+torch/_inductor/codegen/rocm/rocm_cpp_scheduling.py
+torch/_inductor/codegen/simd.py
+torch/_inductor/codegen/triton.py
+torch/_inductor/codegen/wrapper.py
+torch/_inductor/metrics.py
+torch/_inductor/scheduler.py

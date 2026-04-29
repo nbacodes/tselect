@@ -1,0 +1,6 @@
+PR: #181700
+Description: TMA load in fused pointwise epilogues
+Category: gpu-codegen
+Changed files (from diff): 900
+Selected tests (tselect): 0
+0

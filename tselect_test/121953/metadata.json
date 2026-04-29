@@ -1,0 +1,18 @@
+{
+  "pr": "121953",
+  "desc": "Fix addmm fusion check",
+  "category": "bug-fix",
+  "changed_files": [
+    "test/inductor/test_mkldnn_pattern_matcher.py",
+    "torch/_inductor/fx_passes/mkldnn_fusion.py"
+  ],
+  "selected_count": 1,
+  "total_methods_traversed": 36,
+  "error": null,
+  "config": {
+    "graph": {
+      "fanout_threshold": 30,
+      "transitive_depth": 1
+    }
+  }
+}

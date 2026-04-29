@@ -1,0 +1,6 @@
+PR: #121953
+Description: Fix addmm fusion check
+Category: bug-fix
+Changed files (from diff): 2
+Selected tests (tselect): 0
+0

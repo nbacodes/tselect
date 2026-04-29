@@ -1,0 +1,6 @@
+PR: #145691
+Description: Add typing to common.py
+Category: types-only
+Changed files (from diff): 16
+Selected tests (tselect): 0
+0

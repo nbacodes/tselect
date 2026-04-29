@@ -1,0 +1,1201 @@
+diff --git a/test/inductor/extension_backends/cpp/extension_codegen_backend.py b/test/inductor/extension_backends/cpp/extension_codegen_backend.py
+index f241284c4ae..f6afd87db75 100644
+--- a/test/inductor/extension_backends/cpp/extension_codegen_backend.py
++++ b/test/inductor/extension_backends/cpp/extension_codegen_backend.py
+@@ -15,7 +15,7 @@ class ExtensionCppWrapperCodegen(cpp_wrapper_cpu.CppWrapperCpu):
+ 
+ class ExtensionScheduling(BaseScheduling):
+     def __init__(self, scheduler):
+-        self.scheduler = scheduler
++        super().__init__(scheduler)
+         self._scheduling = cpp.CppScheduling(scheduler)
+ 
+     def can_fuse_vertical(self, node1, node2):
+diff --git a/test/inductor/extension_backends/triton/extension_codegen_backend.py b/test/inductor/extension_backends/triton/extension_codegen_backend.py
+index 9a292678b3f..3e77a29caac 100644
+--- a/test/inductor/extension_backends/triton/extension_codegen_backend.py
++++ b/test/inductor/extension_backends/triton/extension_codegen_backend.py
+@@ -10,7 +10,7 @@ class ExtensionWrapperCodegen(wrapper.PythonWrapperCodegen):
+ 
+ class ExtensionScheduling(BaseScheduling):
+     def __init__(self, scheduler):
+-        self.scheduler = scheduler
++        super().__init__(scheduler)
+         self._triton_scheduling = triton.TritonScheduling(scheduler)
+ 
+     def can_fuse_vertical(self, node1, node2):
+diff --git a/torch/_inductor/codegen/common.py b/torch/_inductor/codegen/common.py
+index 0276ee6d8d9..92be62dcbf8 100644
+--- a/torch/_inductor/codegen/common.py
++++ b/torch/_inductor/codegen/common.py
+@@ -14,12 +14,6 @@ from enum import auto, Enum
+ from itertools import chain
+ from typing import Any, Callable, ClassVar, NamedTuple, Optional, TYPE_CHECKING, Union
+ 
+-from torch.utils._ordered_set import OrderedSet
+-
+-
+-if TYPE_CHECKING:
+-    from typing import Never
+-
+ import sympy
+ 
+ import torch
+@@ -27,6 +21,7 @@ import torch.fx
+ from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
+ from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
+ from torch.utils import _pytree as pytree
++from torch.utils._ordered_set import OrderedSet
+ from torch.utils._sympy.numbers import int_oo
+ from torch.utils._sympy.printers import PythonPrinter as _PythonPrinter
+ from torch.utils._sympy.symbol import free_symbol_is_type, symbol_is_type, SymT
+@@ -46,11 +41,24 @@ from ..utils import (
+ from ..virtualized import ops, OpsHandler, OpsValue, ReductionType, StoreMode, V
+ 
+ 
++if TYPE_CHECKING:
++    from typing import Never, TypeVar
++
++    from ..ir import FixedLayout
++    from ..loop_body import LoopBody
++    from ..scheduler import BaseScheduling, Scheduler
++    from .wrapper import PythonWrapperCodegen
++
++    _T = TypeVar("_T")
++    SchedulingConstructor = Callable[[Optional[Scheduler]], BaseScheduling]
++    WrapperConstructor = type[PythonWrapperCodegen]
++    SymbolLike = Union[str, sympy.Symbol]
++
+ schedule_log = torch._logging.getArtifactLogger(__name__, "schedule")
+ log = logging.getLogger(__name__)
+ 
+ 
+-def data_type_logger(msg):
++def data_type_logger(msg: str) -> None:
+     if schedule_log.isEnabledFor(logging.DEBUG):
+         schedule_log.debug("Data type propagation: %s", msg)
+ 
+@@ -61,7 +69,7 @@ class WorkspaceZeroMode(enum.Enum):
+     ZERO_PER_GRAPH = 2  # must be re-zeroed by kernel
+ 
+     @staticmethod
+-    def combine(a, b):
++    def combine(a: WorkspaceZeroMode, b: WorkspaceZeroMode) -> WorkspaceZeroMode:
+         if a == b or b == WorkspaceZeroMode.UNINITIALIZED:
+             return a
+         if a == WorkspaceZeroMode.UNINITIALIZED:
+@@ -69,7 +77,7 @@ class WorkspaceZeroMode(enum.Enum):
+         raise NotImplementedError(f"WorkspaceZeroMode.combine({a!r}, {b!r})")
+ 
+     @staticmethod
+-    def from_bool(zero_fill):
++    def from_bool(zero_fill: bool) -> WorkspaceZeroMode:
+         if zero_fill:
+             return WorkspaceZeroMode.ZERO_ON_CALL
+         return WorkspaceZeroMode.UNINITIALIZED
+@@ -96,17 +104,17 @@ class WorkspaceArg:
+     dtype: torch.dtype = torch.uint8
+ 
+     @staticmethod
+-    def unique_name(prefix="workspace_"):
++    def unique_name(prefix="workspace_") -> str:
+         return f"{prefix}{next(V.graph.workspace_id)}"
+ 
+     @staticmethod
+-    def can_join(a, b) -> bool:
++    def can_join(a: WorkspaceArg, b: WorkspaceArg) -> bool:
+         return (
+             a.inner_name == b.inner_name and a.dtype == b.dtype and a.device == b.device
+         )
+ 
+     @staticmethod
+-    def join(a, b):
++    def join(a: WorkspaceArg, b: WorkspaceArg) -> WorkspaceArg:
+         return WorkspaceArg(
+             count=a.count + b.count,
+             zero_mode=WorkspaceZeroMode.combine(a.zero_mode, b.zero_mode),
+@@ -117,7 +125,7 @@ class WorkspaceArg:
+         )
+ 
+     @staticmethod
+-    def maximum(a, b):
++    def maximum(a: WorkspaceArg, b: WorkspaceArg) -> WorkspaceArg:
+         assert (
+             a.dtype == b.dtype and a.device == b.device and a.inner_name == b.inner_name
+         )
+@@ -131,15 +139,15 @@ class WorkspaceArg:
+         )
+ 
+     # These methods let WorkspaceArg pretend it is a buffer to reuse allocation code
+-    def get_device(self):
++    def get_device(self) -> torch.device:
+         return self.device
+ 
+     get_device_or_error = get_device
+ 
+-    def get_dtype(self):
++    def get_dtype(self) -> torch.dtype:
+         return self.dtype
+ 
+-    def get_layout(self):
++    def get_layout(self) -> FixedLayout:
+         from ..ir import FixedLayout
+ 
+         return FixedLayout(
+@@ -150,23 +158,23 @@ class WorkspaceArg:
+         )
+ 
+     @property
+-    def layout(self):
++    def layout(self) -> FixedLayout:
+         return self.get_layout()
+ 
+     get_output_spec = get_layout
+     maybe_get_output_spec = get_layout
+     maybe_get_layout = get_layout
+ 
+-    def get_size(self):
++    def get_size(self) -> list[sympy.Expr]:
+         return [self.count]
+ 
+-    def get_stride(self):
+-        return [1]
++    def get_stride(self) -> list[sympy.Expr]:
++        return [sympy.S.One]
+ 
+-    def get_name(self):
++    def get_name(self) -> str:
+         return self.outer_name
+ 
+-    def get_inputs_that_alias_output(self):
++    def get_inputs_that_alias_output(self) -> list[str]:
+         return []
+ 
+ 
+@@ -185,7 +193,7 @@ class SizeArg:
+     expr: sympy.Expr
+ 
+     @property
+-    def alias_of(self):
++    def alias_of(self) -> Optional[str]:
+         return None
+ 
+ 
+@@ -201,9 +209,9 @@ class TMADescriptorArg:
+ 
+ @dataclasses.dataclass
+ class DeviceCodegen:
+-    scheduling: Any
+-    wrapper_codegen: type
+-    cpp_wrapper_codegen: type = type(None)
++    scheduling: SchedulingConstructor
++    wrapper_codegen: WrapperConstructor
++    cpp_wrapper_codegen: Optional[WrapperConstructor] = None
+ 
+ 
+ KernelArgType = Union[WorkspaceArg, TensorArg, SizeArg, TMADescriptorArg]
+@@ -212,16 +220,16 @@ device_codegens: dict[str, DeviceCodegen] = {}
+ 
+ 
+ class DeviceOpOverrides:
+-    def import_get_raw_stream_as(self, name):
++    def import_get_raw_stream_as(self, name: str):
+         raise NotImplementedError
+ 
+-    def set_device(self, device_idx):
++    def set_device(self, device_idx: int) -> str:
+         raise NotImplementedError
+ 
+     def synchronize(self):
+         raise NotImplementedError
+ 
+-    def device_guard(self, device_idx):
++    def device_guard(self, device_idx: int) -> str:
+         raise NotImplementedError
+ 
+     def cpp_device_guard(self):
+@@ -290,10 +298,10 @@ device_op_overrides_dict: dict[str, DeviceOpOverrides] = {}
+ # https://github.com/intel/intel-extension-for-pytorch/blob/5dcc9d57e5422cf295e1a1ee97896d6b6a554a85/intel_extension_for_pytorch/_inductor/__init__.py#L9
+ def register_backend_for_device(
+     device: str,
+-    device_scheduling: Any,
+-    device_wrapper_codegen: type,
+-    device_cpp_wrapper_codegen: type = type(None),
+-):
++    device_scheduling: SchedulingConstructor,
++    device_wrapper_codegen: WrapperConstructor,
++    device_cpp_wrapper_codegen: Optional[WrapperConstructor] = None,
++) -> None:
+     device_codegens[device] = DeviceCodegen(
+         device_scheduling, device_wrapper_codegen, device_cpp_wrapper_codegen
+     )
+@@ -322,21 +330,27 @@ def get_backend_features(device: Union[torch.device, str, None]):
+         assert isinstance(device, str)
+         device_type = device
+         device = torch.device(device_type)
+-    scheduling = get_scheduling_for_device(device_type)
+-    return scheduling(None).get_backend_features(device)
++    scheduling_ctor = get_scheduling_for_device(device_type)
++    assert scheduling_ctor
++    scheduling = scheduling_ctor(None)
++    return scheduling.get_backend_features(device)
+ 
+ 
+-def has_backend_feature(device, feature):
++def has_backend_feature(
++    device: Union[torch.device, str, None], feature: BackendFeature
++) -> bool:
+     """See also V.graph.has_feature"""
+     assert isinstance(feature, BackendFeature)
+     return feature in get_backend_features(device)
+ 
+ 
+-def get_scheduling_for_device(device: str):
++def get_scheduling_for_device(device: str) -> Optional[SchedulingConstructor]:
+     return device_codegens[device].scheduling if device in device_codegens else None
+ 
+ 
+-def get_wrapper_codegen_for_device(device: str, cpp_wrapper: bool = False):
++def get_wrapper_codegen_for_device(
++    device: str, cpp_wrapper: bool = False
++) -> Optional[WrapperConstructor]:
+     if device in device_codegens:
+         wrapper_codegen_obj: DeviceCodegen = device_codegens[device]
+         return (
+@@ -348,7 +362,7 @@ def get_wrapper_codegen_for_device(device: str, cpp_wrapper: bool = False):
+ 
+ 
+ @functools.lru_cache(None)
+-def init_backend_registration():
++def init_backend_registration() -> None:
+     from .cpp import CppScheduling
+     from .cpp_wrapper_cpu import CppWrapperCpu
+     from .cpp_wrapper_cpu_array_ref import CppWrapperCpuArrayRef
+@@ -367,7 +381,7 @@ def init_backend_registration():
+         }
+         register_backend_for_device(
+             "cpu",
+-            lambda *args, **kwargs: cpu_backends[config.cpu_backend](*args, **kwargs),
++            lambda scheduling: cpu_backends[config.cpu_backend](scheduling),
+             PythonWrapperCodegen,
+             CppWrapperCpuArrayRef
+             if config.aot_inductor.allow_stack_allocation
+@@ -376,10 +390,13 @@ def init_backend_registration():
+ 
+     if get_scheduling_for_device("cuda") is None:
+         # CUDACombinedScheduling combines Triton and CUDA C++ scheduling for CUDA devices via delegation
+-        cuda_backends = {"triton": CUDACombinedScheduling, "halide": HalideScheduling}
++        cuda_backends = {
++            "triton": CUDACombinedScheduling,
++            "halide": HalideScheduling,
++        }
+         register_backend_for_device(
+             "cuda",
+-            lambda *args, **kwargs: cuda_backends[config.cuda_backend](*args, **kwargs),
++            lambda scheduling: cuda_backends[config.cuda_backend](scheduling),
+             PythonWrapperCodegen,
+             CppWrapperGpu,
+         )
+@@ -422,30 +439,33 @@ def init_backend_registration():
+             pass
+ 
+ 
+-def index_prevent_reordering(index: list[sympy.Expr], index_vars, sizes):
++def index_prevent_reordering(
++    index: list[sympy.Expr], index_vars, sizes
++) -> list[sympy.Expr]:
+     from ..ir import FlexibleLayout
+ 
+     # added contiguous index prevents reordering
+     return [*index, sympy_dot(index_vars, FlexibleLayout.contiguous_strides(sizes))]
+ 
+ 
+-def register_device_op_overrides(device: str, device_op_overrides: DeviceOpOverrides):
++def register_device_op_overrides(
++    device: str, device_op_overrides: DeviceOpOverrides
++) -> None:
+     device_op_overrides_dict[device] = device_op_overrides
+ 
+ 
+-def get_device_op_overrides(device: str):
++def get_device_op_overrides(device: str) -> DeviceOpOverrides:
+     assert isinstance(device, str)
+ 
+-    if not device_op_overrides_dict.keys():
++    if not device_op_overrides_dict:
+         from . import cpu_device_op_overrides, mps_device_op_overrides  # noqa: F401
+         from .cuda import device_op_overrides  # noqa: F401
+         from .xpu import device_op_overrides as xpu_op_overrides  # noqa: F401
+ 
+-    if device in device_op_overrides_dict.keys():
+-        return device_op_overrides_dict[device]
++    return device_op_overrides_dict[device]
+ 
+ 
+-DTYPE_TO_COMPUTATION_DTYPE = {
++DTYPE_TO_COMPUTATION_DTYPE: dict[torch.dtype, torch.dtype] = {
+     torch.bfloat16: torch.float,
+     torch.float16: torch.float,
+     **{
+@@ -469,8 +489,8 @@ DTYPE_TO_COMPUTATION_DTYPE = {
+ 
+ def deduce_output_dtype_by_name(
+     op_name: str,
+-    *args,
+-    **kwargs,
++    *args: Any,
++    **kwargs: Any,
+ ) -> Optional[torch.dtype]:
+     """
+     Given op name and a list of input dtypes, deduce the output dtype
+@@ -511,7 +531,7 @@ def deduce_output_dtype_by_name(
+ 
+ 
+ class DataTypePropagation:
+-    def __init__(self, body) -> None:
++    def __init__(self, body: LoopBody) -> None:
+         self.body = body
+         self.graphs: dict[Union[Callable[..., Any], str], Any] = {
+             "root": body.root_block.graph
+@@ -519,7 +539,7 @@ class DataTypePropagation:
+         for k, v in body.subblocks.items():
+             self.graphs[k] = v.graph
+ 
+-    def deduce_node_dtype_by_inputs(self, node: torch.fx.Node):
++    def deduce_node_dtype_by_inputs(self, node: torch.fx.Node) -> Optional[torch.dtype]:
+         inputs = node.all_input_nodes
+         input_nodes = [
+             n for n in inputs if isinstance(n, torch.fx.Node) and n.op != "placeholder"
+@@ -540,13 +560,13 @@ class DataTypePropagation:
+             [n.meta[OptimizationContext.key].dtype for n in input_nodes],
+         )
+ 
+-    def deduce_node_dtype_by_subgraph(self, node: torch.fx.Node):
++    def deduce_node_dtype_by_subgraph(self, node: torch.fx.Node) -> torch.dtype:
+         sub_graph = self.graphs[node.target]
+         dtype = self.propagate_graph(sub_graph)
+         assert dtype
+         return dtype
+ 
+-    def deduce_node_dtype(self, node: torch.fx.Node):
++    def deduce_node_dtype(self, node: torch.fx.Node) -> Optional[torch.dtype]:
+         if node.op == "placeholder":
+             return None
+ 
+@@ -573,9 +593,9 @@ class DataTypePropagation:
+ 
+         return self.deduce_node_dtype_by_inputs(node)
+ 
+-    def propagate_graph(self, graph: torch.fx.Graph):
++    def propagate_graph(self, graph: torch.fx.Graph) -> Optional[torch.dtype]:
+         assert graph.nodes
+-        graph_dtype = None
++        graph_dtype: Optional[torch.dtype] = None
+         # For masked_subblock, we use output's dtype to represent
+         # the dtype of this subgraph. For other cases, graph_dtype
+         # might be None
+@@ -591,25 +611,27 @@ class DataTypePropagation:
+                 graph_dtype = opt_ctx.dtype
+         return graph_dtype
+ 
+-    def propagate(self):
+-        self.propagate_graph(self.graphs["root"])
++    def propagate(self) -> Optional[torch.dtype]:
++        return self.propagate_graph(self.graphs["root"])
+ 
+     @classmethod
+-    def propagate_loopbody(cls, body):
++    def propagate_loopbody(cls, body) -> Optional[torch.dtype]:
+         return cls(body).propagate()
+ 
+     @classmethod
+-    def propagate_scheduler_node(cls, node):
++    def propagate_scheduler_node(cls, node) -> Optional[torch.dtype]:
+         from ..loop_body import LoopBody
+         from ..scheduler import SchedulerNode
+ 
+         assert isinstance(node, SchedulerNode)
+         assert isinstance(node._body, LoopBody)
+-        DataTypePropagation.propagate_loopbody(node._body)
++        return DataTypePropagation.propagate_loopbody(node._body)
+ 
+ 
+ class PythonPrinter(_PythonPrinter):
+-    def doprint(self, expr, *, simplify: bool = True, p=True):
++    def doprint(
++        self, expr: sympy.Expr, *, simplify: bool = True, p: bool = True
++    ) -> str:
+         # TODO: why are people passing strings to the printer here :think:
+         if simplify and isinstance(expr, sympy.Expr) and hasattr(V.graph, "sizevars"):
+             expr = V.graph.sizevars.simplify(expr)
+@@ -622,7 +644,7 @@ class OpDecompositions:
+     """
+ 
+     @staticmethod
+-    def identity(value):
++    def identity(value: _T) -> _T:
+         # used to trigger cse
+         return value
+ 
+@@ -1093,7 +1115,7 @@ class DeferredLine(DeferredLineBase):
+ 
+ 
+ class BracesBuffer(IndentedBuffer):
+-    def indent(self, offset=1):
++    def indent(self, offset=1) -> contextlib.AbstractContextManager[None]:
+         @contextlib.contextmanager
+         def ctx():
+             for _ in range(offset):
+@@ -1120,7 +1142,7 @@ class InplacedBuffer(NamedTuple):
+ 
+ class KernelArgs:
+     @staticmethod
+-    def _lookup(prefix, odict, name):
++    def _lookup(prefix: str, odict: dict[SymbolLike, str], name: SymbolLike) -> str:
+         assert isinstance(name, (str, sympy.Symbol))
+         if name not in odict:
+             odict[name] = f"{prefix}{len(odict)}"
+@@ -1133,7 +1155,7 @@ class KernelArgs:
+         self.sizevars = sizevars or {}
+         self.workspace_args = []
+ 
+-    def __repr__(self):
++    def __repr__(self) -> str:
+         return "KernelArgs({})".format(
+             ", ".join(
+                 map(
+@@ -1185,7 +1207,7 @@ class KernelArgs:
+             self.inplace_buffers[input_name] = buf
+             self.inplace_buffers[output_name] = buf
+ 
+-    def workspace(self, nbytes: sympy.Expr, zero_fill: bool):
++    def workspace(self, nbytes: sympy.Expr, zero_fill: bool) -> tuple[str, int]:
+         """
+         Allocate or extend a workspace buffer of nbytes bytes.
+ 
+@@ -1226,7 +1248,7 @@ class KernelArgs:
+         self.workspace_args.append(arg)
+         return arg.inner_name, 0
+ 
+-    def semaphores(self, min_size: sympy.Expr):
++    def semaphores(self, min_size: sympy.Expr) -> str:
+         """
+         Lazily allocate a graph-wide semaphores buffer with at least min_size.  This is a single buffer shared by
+         all kernels and zero initialized once at graph start.  Each kernel must leave the buffer zeroed on exit.
+diff --git a/torch/_inductor/codegen/cpp.py b/torch/_inductor/codegen/cpp.py
+index 61d1419ee7f..101e99d0f5c 100644
+--- a/torch/_inductor/codegen/cpp.py
++++ b/torch/_inductor/codegen/cpp.py
+@@ -4251,8 +4251,7 @@ class CppScheduling(BaseScheduling):
+         return cls.backend_features
+ 
+     def __init__(self, scheduler):
+-        super().__init__()
+-        self.scheduler = scheduler
++        super().__init__(scheduler)
+         if scheduler:
+             self.reset_kernel_group()
+         self._ready_to_flush = False
+@@ -4955,7 +4954,7 @@ class CppScheduling(BaseScheduling):
+ 
+         kernel.call_kernel(kernel_name, ctb)
+         V.graph.removed_buffers |= kernel.removed_buffers
+-        self.scheduler.free_buffers()
++        self.free_buffers_in_scheduler()
+ 
+     def _get_scheduled_num_args(self):
+         return self.kernel_group.get_num_args()
+diff --git a/torch/_inductor/codegen/cpp_wrapper_cpu.py b/torch/_inductor/codegen/cpp_wrapper_cpu.py
+index 1f71a9eccff..d1e83360004 100644
+--- a/torch/_inductor/codegen/cpp_wrapper_cpu.py
++++ b/torch/_inductor/codegen/cpp_wrapper_cpu.py
+@@ -70,7 +70,9 @@ class CppWrapperCpu(PythonWrapperCodegen):
+ 
+     @staticmethod
+     def create(
+-        is_subgraph: bool, subgraph_name: str, parent_wrapper: PythonWrapperCodegen
++        is_subgraph: bool,
++        subgraph_name: Optional[str],
++        parent_wrapper: Optional[PythonWrapperCodegen],
+     ):
+         # TODO - support subgraph codegen by lifting functions. Check the
+         # comment at CppWrapperCpu `codegen_subgraph` function.
+diff --git a/torch/_inductor/codegen/cpp_wrapper_cpu_array_ref.py b/torch/_inductor/codegen/cpp_wrapper_cpu_array_ref.py
+index bc79f2bbb73..44b76299efb 100644
+--- a/torch/_inductor/codegen/cpp_wrapper_cpu_array_ref.py
++++ b/torch/_inductor/codegen/cpp_wrapper_cpu_array_ref.py
+@@ -64,7 +64,9 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
+ 
+     @staticmethod
+     def create(
+-        is_subgraph: bool, subgraph_name: str, parent_wrapper: PythonWrapperCodegen
++        is_subgraph: bool,
++        subgraph_name: Optional[str],
++        parent_wrapper: Optional[PythonWrapperCodegen],
+     ):
+         # TODO - support subgraph codegen by lifting functions. Check the
+         # comment at CppWrapperCpu `codegen_subgraph` function.
+diff --git a/torch/_inductor/codegen/cpp_wrapper_gpu.py b/torch/_inductor/codegen/cpp_wrapper_gpu.py
+index d0d5cccb595..64b5b2812b0 100644
+--- a/torch/_inductor/codegen/cpp_wrapper_gpu.py
++++ b/torch/_inductor/codegen/cpp_wrapper_gpu.py
+@@ -191,7 +191,9 @@ class CppWrapperGpu(CppWrapperCpu):
+ 
+     @staticmethod
+     def create(
+-        is_subgraph: bool, subgraph_name: str, parent_wrapper: PythonWrapperCodegen
++        is_subgraph: bool,
++        subgraph_name: Optional[str],
++        parent_wrapper: Optional[PythonWrapperCodegen],
+     ):
+         # TODO - support subgraph codegen by lifting functions. Check the
+         # comment at CppWrapperCpu `codegen_subgraph` function.
+diff --git a/torch/_inductor/codegen/cuda/cuda_cpp_scheduling.py b/torch/_inductor/codegen/cuda/cuda_cpp_scheduling.py
+index 64e6f08ee07..13934b83528 100644
+--- a/torch/_inductor/codegen/cuda/cuda_cpp_scheduling.py
++++ b/torch/_inductor/codegen/cuda/cuda_cpp_scheduling.py
+@@ -7,7 +7,7 @@ from ...._dynamo.utils import counters
+ from ... import config
+ from ...codecache import code_hash, get_path
+ from ...ir import CUDATemplateBuffer
+-from ...scheduler import BaseSchedulerNode, BaseScheduling, Scheduler, SchedulerNode
++from ...scheduler import BaseSchedulerNode, BaseScheduling, SchedulerNode
+ from ...utils import get_fused_kernel_name, get_kernel_metadata, sympy_product
+ from ...virtualized import V
+ from ..common import IndentedBuffer
+@@ -25,10 +25,6 @@ class CUDACPPScheduling(BaseScheduling):
+     It handles fusion decisions and CUDA C++ specific template code generation.
+     """
+ 
+-    def __init__(self, scheduler: Scheduler) -> None:
+-        super().__init__()
+-        self.scheduler = scheduler
+-
+     @classmethod
+     def get_backend_features(cls, device):
+         return {}
+@@ -115,4 +111,4 @@ class CUDACPPScheduling(BaseScheduling):
+             kernel.call_kernel(kernel_name, ctb)
+ 
+         V.graph.removed_buffers |= kernel.removed_buffers
+-        self.scheduler.free_buffers()
++        self.free_buffers_in_scheduler()
+diff --git a/torch/_inductor/codegen/cuda_combined_scheduling.py b/torch/_inductor/codegen/cuda_combined_scheduling.py
+index 6d1f94fed97..df7faa510f9 100644
+--- a/torch/_inductor/codegen/cuda_combined_scheduling.py
++++ b/torch/_inductor/codegen/cuda_combined_scheduling.py
+@@ -1,6 +1,6 @@
+ # mypy: allow-untyped-defs
+ from collections.abc import Sequence
+-from typing import Union
++from typing import Optional, Union
+ 
+ from ..scheduler import (
+     BaseSchedulerNode,
+@@ -24,9 +24,8 @@ class CUDACombinedScheduling(BaseScheduling):
+     this would also be the place to do it.
+     """
+ 
+-    def __init__(self, scheduler: Scheduler) -> None:
+-        super().__init__()
+-        self._scheduler = scheduler
++    def __init__(self, scheduler: Optional[Scheduler]) -> None:
++        super().__init__(scheduler)
+         self._triton_scheduling = TritonScheduling(scheduler)
+         self._cuda_cpp_scheduling = CUDACPPScheduling(scheduler)
+         self._rocm_cpp_scheduling = ROCmCPPScheduling(scheduler)
+diff --git a/torch/_inductor/codegen/mps.py b/torch/_inductor/codegen/mps.py
+index 68d28c7fe13..a21b8731acc 100644
+--- a/torch/_inductor/codegen/mps.py
++++ b/torch/_inductor/codegen/mps.py
+@@ -437,7 +437,7 @@ class MetalKernel(SIMDKernel):
+ class MetalScheduling(SIMDScheduling):
+     kernel_type = MetalKernel  # type: ignore[assignment]
+ 
+-    def __init__(self, scheduler: Scheduler) -> None:
++    def __init__(self, scheduler: Optional[Scheduler]) -> None:
+         super().__init__(scheduler)
+         wrapper = V.graph.wrapper_code
+         if wrapper is not None:
+diff --git a/torch/_inductor/codegen/rocm/rocm_cpp_scheduling.py b/torch/_inductor/codegen/rocm/rocm_cpp_scheduling.py
+index 2b7a935a4c1..0b8b16d36cb 100644
+--- a/torch/_inductor/codegen/rocm/rocm_cpp_scheduling.py
++++ b/torch/_inductor/codegen/rocm/rocm_cpp_scheduling.py
+@@ -5,7 +5,7 @@ from typing import cast
+ 
+ from ... import config
+ from ...codecache import code_hash, get_path
+-from ...scheduler import BaseSchedulerNode, BaseScheduling, Scheduler, SchedulerNode
++from ...scheduler import BaseSchedulerNode, BaseScheduling, SchedulerNode
+ from ...utils import get_fused_kernel_name, get_kernel_metadata, sympy_product
+ from ...virtualized import V
+ from ..common import IndentedBuffer
+@@ -24,10 +24,6 @@ class ROCmCPPScheduling(BaseScheduling):
+     It handles fusion decisions and ROCm C++ specific template code generation.
+     """
+ 
+-    def __init__(self, scheduler: Scheduler) -> None:
+-        super().__init__()
+-        self.scheduler = scheduler
+-
+     def group_fn(self, sizes):
+         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
+ 
+@@ -100,4 +96,4 @@ class ROCmCPPScheduling(BaseScheduling):
+             kernel_name = self.define_kernel(src_code, node_schedule)
+         kernel.call_kernel(kernel_name, ctb)
+         V.graph.removed_buffers |= kernel.removed_buffers
+-        self.scheduler.free_buffers()
++        self.free_buffers_in_scheduler()
+diff --git a/torch/_inductor/codegen/simd.py b/torch/_inductor/codegen/simd.py
+index 155687fde88..a011fa82d43 100644
+--- a/torch/_inductor/codegen/simd.py
++++ b/torch/_inductor/codegen/simd.py
+@@ -11,7 +11,15 @@ import math
+ import operator
+ import textwrap
+ from collections import Counter
+-from typing import Any, Callable, no_type_check, Optional, TYPE_CHECKING, Union
++from typing import (
++    Any,
++    Callable,
++    Iterator,
++    no_type_check,
++    Optional,
++    TYPE_CHECKING,
++    Union,
++)
+ 
+ import sympy
+ 
+@@ -125,7 +133,7 @@ class IterationRanges:
+     def is_reduction(self) -> bool:
+         return prefix_is_reduction(self.prefix)
+ 
+-    def symbol(self):
++    def symbol(self) -> sympy.Symbol:
+         return sympy_index_symbol(self.name)
+ 
+     @property
+@@ -144,7 +152,7 @@ class IterationRangesRoot(IterationRanges):
+         prefix: str,
+         index: int,
+         kernel: SIMDKernel,
+-        pid_cache=None,
++        pid_cache: Optional[dict[str, str]] = None,
+         *,
+         is_loop: bool,
+         tensor_dim: Optional[int],
+@@ -182,14 +190,14 @@ class IterationRangesRoot(IterationRanges):
+     def __repr__(self) -> str:
+         return f"IterationRangesRoot({self.name!r}, {self.numel}, ...)"
+ 
+-    def cache_clear(self):
++    def cache_clear(self) -> None:
+         for node in self.nodes.values():
+             node.cache_clear()
+ 
+-    def index_sym(self):
++    def index_sym(self) -> sympy.Symbol:
+         return sympy_index_symbol(f"{self.prefix}index")
+ 
+-    def lookup(self, divisor, length):
++    def lookup(self, divisor: sympy.Expr, length: sympy.Expr) -> IterationRangesEntry:
+         """
+         Lookup a given RangeTreeEntry, creating it if needed
+         """
+@@ -212,18 +220,22 @@ class IterationRangesRoot(IterationRanges):
+             self.nodes[expr] = node
+         return self.nodes[expr]
+ 
+-    def construct_entries(self, lengths: list[sympy.Expr]):
++    def construct_entries(
++        self, lengths: list[sympy.Expr]
++    ) -> list[IterationRangesEntry]:
+         divisor = sympy.S.One
+         itervars = []
+         for length in reversed(lengths):
+             itervars.append(self.lookup(divisor, length))
+             divisor = divisor * length
+-        return list(reversed(itervars))
++        return [*reversed(itervars)]
+ 
+-    def construct(self, lengths: list[sympy.Expr]):
++    def construct(self, lengths: list[sympy.Expr]) -> list[sympy.Symbol]:
+         return [e.symbol() for e in self.construct_entries(lengths)]
+ 
+-    def vars_and_sizes(self, index: sympy.Expr):
++    def vars_and_sizes(
++        self, index: sympy.Expr
++    ) -> tuple[list[sympy.Symbol], list[sympy.Expr]]:
+         """Figure out vars from this tree used in index"""
+         nodes = [V.kernel.range_tree_nodes.get(s) for s in index.free_symbols]
+         nodes = [n for n in nodes if n and n.prefix == self.prefix]
+@@ -252,7 +264,7 @@ class IterationRangesRoot(IterationRanges):
+             # fill in unused index var
+             add(self.lookup(divisor, FloorDiv(self.numel, divisor)))
+ 
+-        return list(reversed(index_vars)), list(reversed(sizes))
++        return [*reversed(index_vars)], [*reversed(sizes)]
+ 
+ 
+ class IterationRangesEntry(IterationRanges):
+@@ -282,19 +294,19 @@ class IterationRangesEntry(IterationRanges):
+     def __repr__(self) -> str:
+         return f"IterationRangesEntry({self.name}, {self.divisor}, {self.length}, {self.expr}, {self.var_ranges})"
+ 
+-    def set_name(self, name):
++    def set_name(self, name: str) -> None:
+         self.codegen = lambda: name  # type: ignore[assignment]
+         self.codegen.cache_clear = lambda: None  # type: ignore[method-assign]
+         self.name = name
+ 
+-    def cache_clear(self):
++    def cache_clear(self) -> None:
+         self.codegen.cache_clear()
+ 
+-    def _codegen(self):
++    def _codegen(self) -> str:
+         V.kernel.codegen_iteration_ranges_entry(self)
+         return self.name
+ 
+-    def precomputed_args(self):
++    def precomputed_args(self) -> list[sympy.Expr]:
+         # for dynamic shapes, find parts of indexing expressions that have to be precomputed
+         precomputed_args: list[sympy.Expr] = []
+         if isinstance(self.expr, sympy.Symbol):
+@@ -309,14 +321,15 @@ class IterationRangesEntry(IterationRanges):
+                     precomputed_args.append(arg)
+         return precomputed_args
+ 
+-    def __hash__(self):
++    def __hash__(self) -> int:
+         return hash(self.name)
+ 
+-    def __eq__(self, other):
++    def __eq__(self, other: object) -> bool:
++        assert isinstance(other, IterationRangesEntry)
+         return self.name == other.name
+ 
+ 
+-def constant_repr(value):
++def constant_repr(value: Union[int, float]) -> str:
+     if value == float("inf"):
+         return 'float("inf")'
+     elif value == float("-inf"):
+@@ -331,18 +344,18 @@ class SIMDKernel(Kernel):
+     Common base class for Triton/Halide codegen which both use flattened indexing rather than loop nests.
+     """
+ 
+-    sexpr = pexpr
++    sexpr: Callable[[sympy.Expr], str] = pexpr
+     kexpr: Callable[[sympy.Expr], str]
+-    allow_block_ptr = False
++    allow_block_ptr: bool = False
+     kernel_name: str
+ 
+     def __init__(
+         self,
+         tiling: dict[str, sympy.Expr],
+         features: SIMDKernelFeatures,
+-        pid_cache=None,
+-        override_persistent_reduction=None,
+-        override_cooperative_reduction=None,
++        pid_cache: Optional[dict[str, str]] = None,
++        override_persistent_reduction: Optional[bool] = None,
++        override_cooperative_reduction: Optional[bool] = None,
+     ) -> None:
+         if pid_cache is None:
+             pid_cache = {}
+@@ -396,12 +409,17 @@ class SIMDKernel(Kernel):
+     def index_dtype(self) -> str:
+         return self.dtype_to_str(self.features.select_index_dtype())
+ 
+-    def want_no_x_dim(self):
++    def want_no_x_dim(self) -> bool:
+         return False
+ 
+     def construct_range_trees(
+-        self, pid_cache, inside_reduction, is_reduction, numels, no_x_dim
+-    ):
++        self,
++        pid_cache: Optional[dict[str, str]],
++        inside_reduction: bool,
++        is_reduction: bool,
++        numels: dict[str, sympy.Expr],
++        no_x_dim: bool,
++    ) -> list[IterationRangesRoot]:
+         active_prefixes = OrderedSet(
+             prefix for prefix in all_prefixes if prefix in numels
+         )
+@@ -448,7 +466,7 @@ class SIMDKernel(Kernel):
+             )
+         return range_trees
+ 
+-    def initialize_range_tree(self, pid_cache):
++    def initialize_range_tree(self, pid_cache: dict[str, str]) -> None:
+         range_trees = self.construct_range_trees(
+             pid_cache,
+             self.inside_reduction,
+@@ -458,13 +476,13 @@ class SIMDKernel(Kernel):
+         )
+         self.range_trees.extend(range_trees)
+ 
+-    def finalize_indexing(self, indices: Sequence[sympy.Expr]):
++    def finalize_indexing(self, indices: Sequence[sympy.Expr]) -> None:
+         """
+         Hook called right before codegen with every index that will be
+         used in the fused kernel.
+         """
+ 
+-    def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable):
++    def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+         prior = self.inside_reduction
+         self.inside_reduction = False
+         try:
+@@ -478,17 +496,17 @@ class SIMDKernel(Kernel):
+     def should_use_persistent_reduction(self) -> bool:
+         return False  # defined in subclass
+ 
+-    def var_ranges(self):
++    def var_ranges(self) -> dict[sympy.Symbol, sympy.Expr]:
+         return dict(
+             itertools.chain.from_iterable(
+                 tree.var_ranges.items() for tree in self.range_trees
+             )
+         )
+ 
+-    def triton_tensor_ndim(self):
++    def triton_tensor_ndim(self) -> int:
+         return sum(int(tree.tensor_dim is not None) for tree in self.range_trees)
+ 
+-    def indexing_size_str(self, i):
++    def indexing_size_str(self, i: int) -> str:
+         sizes = ["None"] * self.triton_tensor_ndim()
+         sizes[i] = ":"
+         return f"[{', '.join(sizes)}]"
+@@ -503,11 +521,11 @@ class SIMDKernel(Kernel):
+                 sizes[tree.tensor_dim] = f"{tree.prefix.upper()}BLOCK"
+         return sizes
+ 
+-    def dense_size_str(self):
++    def dense_size_str(self) -> str:
+         sizes = self.dense_size_list()
+         return f"[{', '.join(sizes)}]"
+ 
+-    def combine_modular_indexing_pairs(self, index):
++    def combine_modular_indexing_pairs(self, index: sympy.Expr) -> sympy.Expr:
+         if not isinstance(index, ModularIndexing):
+             return index
+         x = index.args[0]
+@@ -525,14 +543,18 @@ class SIMDKernel(Kernel):
+             },
+         )
+ 
+-    def combine_contiguous_dims(self, index: sympy.Expr, tree: IterationRangesRoot):
++    def combine_contiguous_dims(
++        self, index: sympy.Expr, tree: IterationRangesRoot
++    ) -> sympy.Expr:
+         if expand_res := V.graph.sizevars.expand_floor_div(index):
+             new_index, denominator = expand_res  # type: ignore[misc]
+             return FloorDiv(self._combine_contiguous_dims(new_index, tree), denominator)
+         else:
+             return self._combine_contiguous_dims(index, tree)
+ 
+-    def _combine_contiguous_dims(self, index: sympy.Expr, tree: IterationRangesRoot):
++    def _combine_contiguous_dims(
++        self, index: sympy.Expr, tree: IterationRangesRoot
++    ) -> sympy.Expr:
+         """
+         More aggressive simplification to merge contiguous dims
+         """
+@@ -550,7 +572,7 @@ class SIMDKernel(Kernel):
+         new_index = sympy_subs(index, dict(zip(index_vars, reindex(new_index_vars))))
+         return new_index
+ 
+-    def disable_reduction(self):
++    def disable_reduction(self) -> contextlib.AbstractContextManager[None]:
+         should_flush = self.range_trees[-1].is_loop or self.cooperative_reduction
+ 
+         @contextlib.contextmanager
+@@ -574,7 +596,7 @@ class SIMDKernel(Kernel):
+ 
+         return ctx()
+ 
+-    def set_ranges(self, *lengths):
++    def set_ranges(self, *lengths: sympy.Expr) -> list[sympy.Symbol]:
+         assert len(lengths) == len(self.range_trees)
+         return [
+             ranges.construct(length)
+@@ -584,7 +606,9 @@ class SIMDKernel(Kernel):
+     @staticmethod
+     def _split_iteration_ranges(
+         groups: Iterable[sympy.Expr], lengths: Sequence[Sequence[sympy.Expr]]
+-    ):
++    ) -> tuple[
++        list[list[sympy.Expr]], list[list[Callable[[list[sympy.Expr]], sympy.Expr]]]
++    ]:
+         # Special case: if a node's sizes are ([], []), there's nothing to split.
+         if all(len(length) == 0 for length in lengths):
+             return [[] for group in groups], []
+@@ -594,7 +618,7 @@ class SIMDKernel(Kernel):
+         remaining = [sv.simplify(g) for g in groups]
+         var_count = itertools.count()
+ 
+-        def add_range(i, expr):
++        def add_range(i: int, expr: sympy.Expr) -> int:
+             expr = sv.simplify(expr)
+             if not sv.statically_known_multiple_of(remaining[i], expr):
+                 raise CantSplit
+@@ -603,8 +627,10 @@ class SIMDKernel(Kernel):
+             new_ranges[i].append(expr)
+             return next(var_count)
+ 
+-        def make_combined(size, idx1, idx2):
+-            def getter(flat_vars):
++        def make_combined(
++            size: sympy.Expr, idx1: int, idx2: int
++        ) -> Callable[[list[sympy.Expr]], sympy.Expr]:
++            def getter(flat_vars: list[sympy.Expr]) -> sympy.Expr:
+                 return size * flat_vars[idx1] + flat_vars[idx2]
+ 
+             return getter
+@@ -659,7 +685,7 @@ class SIMDKernel(Kernel):
+         groups: Iterable[sympy.Expr],
+         lengths: Sequence[Sequence[sympy.Expr]],
+         reduction_numel: sympy.Expr = sympy.S.One,
+-    ):
++    ) -> bool:
+         # Fill in the reduction numel, in case the node is missing it.
+         sizevars = V.graph.sizevars
+         if len(lengths[1]) == 0 and (
+@@ -676,7 +702,9 @@ class SIMDKernel(Kernel):
+         except CantSplit:
+             return False
+ 
+-    def split_and_set_ranges(self, lengths: Sequence[Sequence[sympy.Expr]]):
++    def split_and_set_ranges(
++        self, lengths: Sequence[Sequence[sympy.Expr]]
++    ) -> list[list[sympy.Expr]]:
+         tiling = {rt.prefix: rt.numel for rt in self.range_trees}
+         if not self.inside_reduction:
+             for prefix in tiling:
+@@ -715,11 +743,11 @@ class SIMDKernel(Kernel):
+         itervars = [*itertools.chain.from_iterable(set_ranges(*new_ranges))]
+         return [[fn(itervars) for fn in fns] for fns in return_getters_groups]
+ 
+-    def is_indirect_indexing(self, index: sympy.Expr):
++    def is_indirect_indexing(self, index: sympy.Expr) -> bool:
+         # tmpX  means indirect indexing
+         return free_symbol_is_type(index, SymT.TMP)
+ 
+-    def is_broadcasted(self, index: sympy.Expr):
++    def is_broadcasted(self, index: sympy.Expr) -> bool:
+         # Note. This may not be correct when there is indirect indexing
+         if self.is_indirect_indexing(index):
+             return False
+@@ -757,7 +785,7 @@ class SIMDKernel(Kernel):
+     def prepare_indexing(
+         self,
+         index: sympy.Expr,
+-    ):
++    ) -> sympy.Expr:
+         index = self.simplify_indexing(index)
+         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+         # if simple replacements didn't get rid of floor/ceil, try full subs
+@@ -792,7 +820,7 @@ class SIMDKernel(Kernel):
+ 
+         return self.codegen_indexing(simp_index)
+ 
+-    def active_range_trees(self, reorder=False):
++    def active_range_trees(self, reorder: bool = False) -> list[IterationRangesRoot]:
+         trees = [
+             t for t in self.range_trees if not t.is_reduction or self.inside_reduction
+         ]
+@@ -804,7 +832,7 @@ class SIMDKernel(Kernel):
+             trees[:count] = reversed(trees[:count])
+         return trees
+ 
+-    def codegen_indexing(self, expr: sympy.Expr):
++    def codegen_indexing(self, expr: sympy.Expr) -> sympy.Expr:
+         expr = V.graph.sizevars.simplify_with_ranges(expr, self.var_ranges())
+         for sym in sorted(expr.free_symbols, key=str):
+             if sym in self.range_tree_nodes:
+@@ -827,7 +855,9 @@ class SIMDKernel(Kernel):
+         raise NotImplementedError("NYI: call_kernel")
+ 
+     @contextlib.contextmanager
+-    def mask_loads(self, mask, value):
++    def mask_loads(
++        self, mask: Union[str, OpsWrapper], value: Union[int, float]
++    ) -> Iterator[str]:
+         """Context manager to add an additional mask to tl.load/store"""
+         prior = self._load_mask
+         prior_val = self._load_other
+@@ -844,7 +874,7 @@ class SIMDKernel(Kernel):
+             self._load_mask = prior
+             self._load_other = prior_val
+ 
+-    def get_strides_of_load(self, index: sympy.Expr):
++    def get_strides_of_load(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
+         """
+         This gets the stride of the index for each of the tiling variables
+         (technically, it does it at index 0)
+@@ -1032,10 +1062,6 @@ class SIMDKernel(Kernel):
+ class SIMDScheduling(BaseScheduling):
+     kernel_type: type[Any] = SIMDKernel  # override in subclass
+ 
+-    def __init__(self, scheduler) -> None:
+-        super().__init__()
+-        self.scheduler = scheduler
+-
+     def group_fn(self, sizes):
+         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
+ 
+@@ -1381,7 +1407,7 @@ class SIMDScheduling(BaseScheduling):
+                         f"run_intermediate_hooks({origin_node.name!r}, {name})"
+                     )
+ 
+-        self.scheduler.free_buffers()
++        self.free_buffers_in_scheduler()
+ 
+     def create_kernel_choices(
+         self, kernel_features: SIMDKernelFeatures, kernel_args, kernel_kwargs
+@@ -1545,7 +1571,7 @@ class SIMDScheduling(BaseScheduling):
+ 
+         V.graph.removed_buffers |= kernel.removed_buffers
+         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+-        self.scheduler.free_buffers()
++        self.free_buffers_in_scheduler()
+         return None
+ 
+     def codegen_sync(self):
+@@ -1630,7 +1656,7 @@ class SIMDScheduling(BaseScheduling):
+             log.debug("ComboKernels: generated kernel %s.", kernel_name)
+             kernel.call_kernel(V.graph.wrapper_code, kernel_name)
+ 
+-        self.scheduler.free_buffers()
++        self.free_buffers_in_scheduler()
+ 
+     @classmethod
+     @functools.lru_cache(32)
+diff --git a/torch/_inductor/codegen/triton.py b/torch/_inductor/codegen/triton.py
+index c1e9039b649..f6c44abaae0 100644
+--- a/torch/_inductor/codegen/triton.py
++++ b/torch/_inductor/codegen/triton.py
+@@ -292,7 +292,7 @@ class BlockPtrOptions:
+         *,
+         params: BlockParameters,
+         constant_offset: sympy.Expr,
+-        range_trees: list[IterationRangesEntry],
++        range_trees: list[IterationRangesRoot],
+         mask_vars: OrderedSet[str],
+         get_max_block: Callable[[str], int],
+     ) -> BlockPtrOptions:
+@@ -1740,7 +1740,7 @@ class TritonKernel(SIMDKernel):
+         ):
+ 
+             def match_strided_block(
+-                index: sympy.Expr, range_tree: IterationRangesEntry
++                index: sympy.Expr, range_tree: IterationRangesRoot
+             ) -> Optional[BlockParameters]:
+                 """
+                 Matches expressions of the form:
+@@ -1762,7 +1762,7 @@ class TritonKernel(SIMDKernel):
+                 )
+ 
+             def match_mod_div_block(
+-                index: sympy.Expr, range_tree: IterationRangesEntry
++                index: sympy.Expr, range_tree: IterationRangesRoot
+             ) -> Optional[BlockParameters]:
+                 """
+                 Matches higher-dimensional blocks coming from FloorDiv and ModularIndexing.
+@@ -1860,7 +1860,7 @@ class TritonKernel(SIMDKernel):
+                 )
+ 
+             def match_block_pointer_subexpr(
+-                expr: sympy.Expr, range_tree: IterationRangesEntry
++                expr: sympy.Expr, range_tree: IterationRangesRoot
+             ) -> Optional[BlockParameters]:
+                 """
+                 Match a block indexing subexpression involving a single range tree.
+@@ -3831,7 +3831,7 @@ class TritonScheduling(SIMDScheduling):
+             )
+         )
+ 
+-    def __init__(self, scheduler: Scheduler) -> None:
++    def __init__(self, scheduler: Optional[Scheduler]) -> None:
+         super().__init__(scheduler)
+         if scheduler is None or not hasattr(scheduler, "nodes"):
+             return
+diff --git a/torch/_inductor/codegen/wrapper.py b/torch/_inductor/codegen/wrapper.py
+index d76f943fde2..508f325f09f 100644
+--- a/torch/_inductor/codegen/wrapper.py
++++ b/torch/_inductor/codegen/wrapper.py
+@@ -727,9 +727,13 @@ class PythonWrapperCodegen(CodeGen):
+ 
+     @staticmethod
+     def create(
+-        is_subgraph: bool, subgraph_name: str, parent_wrapper: PythonWrapperCodegen
++        is_subgraph: bool,
++        subgraph_name: Optional[str],
++        parent_wrapper: Optional[PythonWrapperCodegen],
+     ):
+         if is_subgraph:
++            assert subgraph_name is not None
++            assert parent_wrapper is not None
+             return SubgraphPythonWrapperCodegen(subgraph_name, parent_wrapper)
+         return PythonWrapperCodegen()
+ 
+@@ -1774,7 +1778,9 @@ class PythonWrapperCodegen(CodeGen):
+         elif ws.zero_mode == WorkspaceZeroMode.ZERO_PER_GRAPH:
+             prior = self.allocated_workspaces.get(name)
+             if prior:
+-                assert isinstance(prior, AllocateLine)
++                assert isinstance(prior, AllocateLine) and isinstance(
++                    prior.node, WorkspaceArg
++                )
+                 # expand existing allocation
+                 prior.node = WorkspaceArg.maximum(prior.node, ws)
+             else:
+@@ -2554,7 +2560,7 @@ class SubgraphPythonWrapperCodegen(PythonWrapperCodegen):
+     imports twice in the output code)
+     """
+ 
+-    def __init__(self, subgraph_name, parent_wrapper):
++    def __init__(self, subgraph_name: str, parent_wrapper: PythonWrapperCodegen):
+         # It is necessary to set the subgraph_name before calling super __init__
+         # because __init__ calls set_launcher_fn_name
+         self.subgraph_name = subgraph_name
+diff --git a/torch/_inductor/metrics.py b/torch/_inductor/metrics.py
+index f4aba743fcf..200c111d87f 100644
+--- a/torch/_inductor/metrics.py
++++ b/torch/_inductor/metrics.py
+@@ -143,7 +143,7 @@ class MetricTable:
+         ), f"{len(self.column_names)} v.s. {len(row_dict)}"
+         assert OrderedSet(self.column_names) == OrderedSet(
+             row_dict.keys()
+-        ), f"{set(self.column_names)} v.s. {set(row_dict.keys())}"
++        ), f"{OrderedSet(self.column_names)} v.s. {OrderedSet(row_dict.keys())}"
+ 
+         row = [
+             get_benchmark_name(),
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index ec29fb075f3..6a539f28adb 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -3915,6 +3915,14 @@ class Scheduler:
+ 
+ 
+ class BaseScheduling:
++    def __init__(self, scheduler: Optional[Scheduler]):
++        super().__init__()
++        self.scheduler = scheduler
++
++    def free_buffers_in_scheduler(self) -> None:
++        if self.scheduler:
++            self.scheduler.free_buffers()
++
+     @classmethod
+     def get_backend_features(cls, device: torch.device) -> Sequence[BackendFeature]:
+         """Return a set of .codegen.common.BackendFeature()"""

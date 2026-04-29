@@ -1,0 +1,18 @@
+{
+  "pr": "145690",
+  "desc": "Add typing to simd.py",
+  "category": "types-only",
+  "changed_files": [
+    "torch/_inductor/codegen/simd.py",
+    "torch/_inductor/codegen/triton.py"
+  ],
+  "selected_count": 7,
+  "total_methods_traversed": 554,
+  "error": null,
+  "config": {
+    "graph": {
+      "fanout_threshold": 30,
+      "transitive_depth": 1
+    }
+  }
+}

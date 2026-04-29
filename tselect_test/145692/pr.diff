@@ -1,0 +1,218 @@
+diff --git a/torch/_inductor/codegen/common.py b/torch/_inductor/codegen/common.py
+index 92be62dcbf8..35171d6bc9b 100644
+--- a/torch/_inductor/codegen/common.py
++++ b/torch/_inductor/codegen/common.py
+@@ -320,9 +320,11 @@ class BackendFeature(Enum):
+     REDUCE_TO_SINGLE_ELEMENT = auto()
+ 
+ 
+-def get_backend_features(device: Union[torch.device, str, None]):
++def get_backend_features(
++    device: Union[torch.device, str, None]
++) -> OrderedSet[BackendFeature]:
+     if device is None:
+-        return {}
++        return OrderedSet()
+     init_backend_registration()
+     if isinstance(device, torch.device):
+         device_type = device.type
+diff --git a/torch/_inductor/codegen/cpp.py b/torch/_inductor/codegen/cpp.py
+index 101e99d0f5c..ed1a8fda529 100644
+--- a/torch/_inductor/codegen/cpp.py
++++ b/torch/_inductor/codegen/cpp.py
+@@ -4239,7 +4239,7 @@ class CppScheduling(BaseScheduling):
+     # https://github.com/python/cpython/commit/a285af7e626d1b81cf09f8b2bf7656f100bc1237
+     # We set a conservative threshold here.
+     MAX_FUSED_KERNEL_ARGS_NUM = 500
+-    backend_features = dict.fromkeys(
++    backend_features = OrderedSet(
+         [
+             BackendFeature.INPLACE_BUFFERS,
+             BackendFeature.REDUCE_TO_SINGLE_ELEMENT,
+@@ -4247,7 +4247,7 @@ class CppScheduling(BaseScheduling):
+     )
+ 
+     @classmethod
+-    def get_backend_features(cls, device: torch.device):
++    def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
+         return cls.backend_features
+ 
+     def __init__(self, scheduler):
+diff --git a/torch/_inductor/codegen/cuda/cuda_cpp_scheduling.py b/torch/_inductor/codegen/cuda/cuda_cpp_scheduling.py
+index 13934b83528..f6bd8615fda 100644
+--- a/torch/_inductor/codegen/cuda/cuda_cpp_scheduling.py
++++ b/torch/_inductor/codegen/cuda/cuda_cpp_scheduling.py
+@@ -3,6 +3,8 @@ import logging
+ from collections.abc import Sequence
+ from typing import cast
+ 
++from torch.utils._ordered_set import OrderedSet
++
+ from ...._dynamo.utils import counters
+ from ... import config
+ from ...codecache import code_hash, get_path
+@@ -10,7 +12,7 @@ from ...ir import CUDATemplateBuffer
+ from ...scheduler import BaseSchedulerNode, BaseScheduling, SchedulerNode
+ from ...utils import get_fused_kernel_name, get_kernel_metadata, sympy_product
+ from ...virtualized import V
+-from ..common import IndentedBuffer
++from ..common import BackendFeature, IndentedBuffer
+ 
+ 
+ log = logging.getLogger(__name__)
+@@ -26,8 +28,8 @@ class CUDACPPScheduling(BaseScheduling):
+     """
+ 
+     @classmethod
+-    def get_backend_features(cls, device):
+-        return {}
++    def get_backend_features(cls, device) -> OrderedSet[BackendFeature]:
++        return OrderedSet()
+ 
+     def group_fn(self, sizes):
+         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
+diff --git a/torch/_inductor/codegen/cuda_combined_scheduling.py b/torch/_inductor/codegen/cuda_combined_scheduling.py
+index df7faa510f9..34310112c27 100644
+--- a/torch/_inductor/codegen/cuda_combined_scheduling.py
++++ b/torch/_inductor/codegen/cuda_combined_scheduling.py
+@@ -1,6 +1,7 @@
+ # mypy: allow-untyped-defs
+-from collections.abc import Sequence
+-from typing import Optional, Union
++from __future__ import annotations
++
++from typing import Optional, TYPE_CHECKING, Union
+ 
+ from ..scheduler import (
+     BaseSchedulerNode,
+@@ -14,6 +15,15 @@ from .rocm.rocm_cpp_scheduling import ROCmCPPScheduling
+ from .triton import TritonScheduling
+ 
+ 
++if TYPE_CHECKING:
++    from collections.abc import Sequence
++
++    import torch
++    from torch.utils._ordered_set import OrderedSet
++
++    from .common import BackendFeature
++
++
+ class CUDACombinedScheduling(BaseScheduling):
+     """
+     Scheduler for CUDA Kernels, which delegates calls as appropriate
+@@ -30,7 +40,7 @@ class CUDACombinedScheduling(BaseScheduling):
+         self._cuda_cpp_scheduling = CUDACPPScheduling(scheduler)
+         self._rocm_cpp_scheduling = ROCmCPPScheduling(scheduler)
+ 
+-    def get_backend_features(self, device):  # type:ignore[override]
++    def get_backend_features(self, device: torch.device) -> OrderedSet[BackendFeature]:
+         return self._triton_scheduling.get_backend_features(device)
+ 
+     def choose_node_backend(self, node: BaseSchedulerNode) -> BaseScheduling:
+@@ -40,12 +50,16 @@ class CUDACombinedScheduling(BaseScheduling):
+             return self._rocm_cpp_scheduling
+         return self._triton_scheduling
+ 
+-    def can_fuse_vertical(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode):
++    def can_fuse_vertical(
++        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
++    ) -> bool:
+         if self._cuda_cpp_scheduling.can_fuse_vertical(node1, node2):
+             return True
+         return self._triton_scheduling.can_fuse_vertical(node1, node2)
+ 
+-    def can_fuse_horizontal(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode):
++    def can_fuse_horizontal(
++        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
++    ) -> bool:
+         for node in (node1, node2):
+             if self._cuda_cpp_scheduling.is_cuda_cpp_template(node):
+                 return self._cuda_cpp_scheduling.can_fuse_horizontal(
+diff --git a/torch/_inductor/codegen/halide.py b/torch/_inductor/codegen/halide.py
+index 84d2a274f18..e931d61c484 100644
+--- a/torch/_inductor/codegen/halide.py
++++ b/torch/_inductor/codegen/halide.py
+@@ -1647,8 +1647,8 @@ class HalideScheduling(SIMDScheduling):
+     kernel_type = HalideKernel  # type: ignore[arg-type,assignment]
+ 
+     @classmethod
+-    def get_backend_features(cls, device: torch.device):
+-        result = dict.fromkeys(
++    def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
++        result = OrderedSet(
+             [
+                 BackendFeature.TUPLE_REDUCTION,
+                 BackendFeature.PREFER_STORE_LOOP_ORDER,
+@@ -1656,7 +1656,7 @@ class HalideScheduling(SIMDScheduling):
+             ]
+         )
+         if config.halide.scan_kernels:
+-            result[BackendFeature.SCAN] = None
++            result.add(BackendFeature.SCAN)
+         return result
+ 
+     def define_kernel(self, src_code, node_schedule, kernel):
+diff --git a/torch/_inductor/codegen/triton.py b/torch/_inductor/codegen/triton.py
+index f6c44abaae0..dd8d11034b1 100644
+--- a/torch/_inductor/codegen/triton.py
++++ b/torch/_inductor/codegen/triton.py
+@@ -3810,7 +3810,7 @@ class TritonKernel(SIMDKernel):
+ 
+ class TritonScheduling(SIMDScheduling):
+     kernel_type: type[Any] = TritonKernel
+-    backend_features = dict.fromkeys(  # dict for deterministic order
++    backend_features = OrderedSet(
+         [
+             BackendFeature.FOREACH,
+             BackendFeature.BUCKETIZE,
+@@ -3822,13 +3822,11 @@ class TritonScheduling(SIMDScheduling):
+     )
+     if torch.version.hip is None:
+         backend_features.update(
+-            dict.fromkeys(
+-                [
+-                    # TODO: Move this above when ROCm triton adds support for multiple inputs
+-                    BackendFeature.TUPLE_REDUCTION,
+-                    BackendFeature.SORT,
+-                ]
+-            )
++            [
++                # TODO: Move this above when ROCm triton adds support for multiple inputs
++                BackendFeature.TUPLE_REDUCTION,
++                BackendFeature.SORT,
++            ]
+         )
+ 
+     def __init__(self, scheduler: Optional[Scheduler]) -> None:
+@@ -3845,10 +3843,9 @@ class TritonScheduling(SIMDScheduling):
+             config.triton.cooperative_reductions
+             or config.triton.force_cooperative_reductions
+         ):
+-            return {
+-                **cls.backend_features,
+-                BackendFeature.REDUCE_TO_SINGLE_ELEMENT: None,
+-            }
++            return OrderedSet(
++                [*cls.backend_features, BackendFeature.REDUCE_TO_SINGLE_ELEMENT]
++            )
+         return cls.backend_features
+ 
+     def codegen_comment(self, node_schedule):
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index 6a539f28adb..dbf1be6ae00 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -3923,10 +3923,9 @@ class BaseScheduling:
+         if self.scheduler:
+             self.scheduler.free_buffers()
+ 
+-    @classmethod
+-    def get_backend_features(cls, device: torch.device) -> Sequence[BackendFeature]:
++    def get_backend_features(self, device: torch.device) -> OrderedSet[BackendFeature]:
+         """Return a set of .codegen.common.BackendFeature()"""
+-        return ()
++        return OrderedSet()
+ 
+     def can_fuse_vertical(
+         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode

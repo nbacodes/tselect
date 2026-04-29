@@ -1,0 +1,7 @@
+test/higher_order_ops/test_inline_asm_elementwise.py
+test/inductor/test_codegen_triton.py
+test/inductor/test_fxir_backend.py
+test/inductor/test_indexing.py
+test/inductor/test_loop_ordering.py
+test/inductor/test_op_completeness.py
+test/inductor/test_torchinductor_strided_blocks.py

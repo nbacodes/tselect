@@ -1,0 +1,11 @@
+ImportError while loading conftest '/Users/nihalkumar/pytorch/test/conftest.py'.
+test/conftest.py:25: in <module>
+    from torch.testing._internal.common_utils import parse_cmd_line_args
+torch/__init__.py:1924: in <module>
+    from torch._tensor import Tensor  # usort: skip
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch/_tensor.py:24: in <module>
+    from torch.overrides import (
+torch/overrides.py:1813: in <module>
+    has_torch_function = _add_docstr(
+E   RuntimeError: function '_has_torch_function' already has a docstring

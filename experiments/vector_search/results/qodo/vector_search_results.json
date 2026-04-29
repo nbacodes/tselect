@@ -1,0 +1,211 @@
+{
+  "pr": "176888",
+  "model": "Qodo-Embed-1-1.5B",
+  "corpus_size": 4237,
+  "changed_functions": [
+    "max_pool2d_with_indices_backward",
+    "max_pool2d_with_indices_backward"
+  ],
+  "top_50": [
+    {
+      "name": "test_uint8_add",
+      "score": 0.12165778875350952
+    },
+    {
+      "name": "test_layer_norm_bwd_no_bias",
+      "score": 0.11088567227125168
+    },
+    {
+      "name": "test_uint8_sub",
+      "score": 0.09554332494735718
+    },
+    {
+      "name": "test_is_fusible_node",
+      "score": 0.0943952202796936
+    },
+    {
+      "name": "test_autotune_skips_invalid_hip_config_and_succeeds",
+      "score": 0.09368977695703506
+    },
+    {
+      "name": "test_layer_norm_bwd_with_bias",
+      "score": 0.09202995151281357
+    },
+    {
+      "name": "test_graph_partition_cpu_tensor_symints",
+      "score": 0.09121949970722198
+    },
+    {
+      "name": "test_pointless_permute_pair_3d",
+      "score": 0.08961346000432968
+    },
+    {
+      "name": "test_reduction_float_to_int64",
+      "score": 0.0870576798915863
+    },
+    {
+      "name": "test_tmp_not_defined_issue1",
+      "score": 0.0854610875248909
+    },
+    {
+      "name": "test_multiple_score_mod_calls_paged_attention2",
+      "score": 0.08217078447341919
+    },
+    {
+      "name": "test_aliased_storage_single_weakref",
+      "score": 0.08206985890865326
+    },
+    {
+      "name": "test_argmax_argmin1",
+      "score": 0.08185169100761414
+    },
+    {
+      "name": "test_storage_resize_nonzero_gpu",
+      "score": 0.08144216239452362
+    },
+    {
+      "name": "test_relative_1d_bias_only_grad",
+      "score": 0.08136800676584244
+    },
+    {
+      "name": "test_pattern_match",
+      "score": 0.08128659427165985
+    },
+    {
+      "name": "test_group_linear_fusion",
+      "score": 0.0809861421585083
+    },
+    {
+      "name": "test_find_independent_subset_greedy_fuse",
+      "score": 0.08072598278522491
+    },
+    {
+      "name": "test_pt2_triton_attributes",
+      "score": 0.08010401576757431
+    },
+    {
+      "name": "test_intersection_subset",
+      "score": 0.07943312078714371
+    },
+    {
+      "name": "test_multiple_mm",
+      "score": 0.07860565185546875
+    },
+    {
+      "name": "test_alias2_dynamic",
+      "score": 0.07860499620437622
+    },
+    {
+      "name": "test_runtime_checks",
+      "score": 0.07845921814441681
+    },
+    {
+      "name": "test_unsupported_conv_transpose",
+      "score": 0.0772230327129364
+    },
+    {
+      "name": "test_trace_auto_functionalized",
+      "score": 0.07697837054729462
+    },
+    {
+      "name": "test_noops_tensor_repropagate",
+      "score": 0.07491566985845566
+    },
+    {
+      "name": "test_implicit_add",
+      "score": 0.07464158535003662
+    },
+    {
+      "name": "test_inductor_profiling_kernel_names_pointwise",
+      "score": 0.07450414448976517
+    },
+    {
+      "name": "test_stride_with_unbacked_expr",
+      "score": 0.07428765296936035
+    },
+    {
+      "name": "test_remove_noop_slice1",
+      "score": 0.07389312982559204
+    },
+    {
+      "name": "test_softmax",
+      "score": 0.07345180958509445
+    },
+    {
+      "name": "test_stable_strings",
+      "score": 0.072537861764431
+    },
+    {
+      "name": "test_move_view_after_cat_aten",
+      "score": 0.07237668335437775
+    },
+    {
+      "name": "test_graph_partition_reorder_cpu_and_gpu_interleave",
+      "score": 0.07205098867416382
+    },
+    {
+      "name": "test_split_reduction_channels_last",
+      "score": 0.07192253321409225
+    },
+    {
+      "name": "test_trace_auto_functionalized_v2",
+      "score": 0.07144704461097717
+    },
+    {
+      "name": "test_triton_kernel_reinterpret_view_mem_leak",
+      "score": 0.070878766477108
+    },
+    {
+      "name": "test_template_aliasing",
+      "score": 0.07065099477767944
+    },
+    {
+      "name": "test_broadcast_with_singleton_dims",
+      "score": 0.07015903294086456
+    },
+    {
+      "name": "test_dequant_quant_lowering_int8",
+      "score": 0.06991296261548996
+    },
+    {
+      "name": "test_cond_with_reinterpret_view_inputs_outputs",
+      "score": 0.06983455270528793
+    },
+    {
+      "name": "test_max_pool2d_with_indices_backward3",
+      "score": 0.06957539170980453
+    },
+    {
+      "name": "test_maybe_append_choice_caching",
+      "score": 0.06946153938770294
+    },
+    {
+      "name": "test_extra_deps_with_merge",
+      "score": 0.06852508336305618
+    },
+    {
+      "name": "test_hierarchical_indexing_2d",
+      "score": 0.06838732957839966
+    },
+    {
+      "name": "test_set_source_Tensor",
+      "score": 0.0681845173239708
+    },
+    {
+      "name": "test_memoizer_replay_disabled_always_raises",
+      "score": 0.06805194169282913
+    },
+    {
+      "name": "test_prologue_masked_load",
+      "score": 0.06797917187213898
+    },
+    {
+      "name": "test_index_propagation_remainder",
+      "score": 0.06763137876987457
+    },
+    {
+      "name": "test_max_min_bool",
+      "score": 0.06744534522294998
+    }
+  ]
+}

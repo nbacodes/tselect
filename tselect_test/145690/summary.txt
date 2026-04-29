@@ -1,0 +1,6 @@
+PR: #145690
+Description: Add typing to simd.py
+Category: types-only
+Changed files (from diff): 2
+Selected tests (tselect): 0
+0

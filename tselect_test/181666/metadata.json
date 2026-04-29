@@ -1,0 +1,17 @@
+{
+  "pr": "181666",
+  "desc": "SDK lib fallback cpp-wrapper",
+  "category": "feature",
+  "changed_files": [
+    "torch/_inductor/cpp_builder.py"
+  ],
+  "selected_count": 3,
+  "total_methods_traversed": 1240,
+  "error": null,
+  "config": {
+    "graph": {
+      "fanout_threshold": 30,
+      "transitive_depth": 1
+    }
+  }
+}

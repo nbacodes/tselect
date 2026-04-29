@@ -20,7 +20,7 @@ if [[ -z "$PR" ]]; then
 fi
 
 # ── Config ────────────────────────────────────────────────────
-PYTORCH_DIR="/Users/nihalkumar/pytorch-pr-176888"
+PYTORCH_DIR="/Users/nihalkumar/pytorch"
 TSELECT_TEST_DIR="/Users/nihalkumar/Desktop/nbaworks/tselect/tselect_test"
 VENV="/Users/nihalkumar/envs/pytorch-dev"
 TIMEOUT=600  # seconds per test file
@@ -49,6 +49,7 @@ echo "╚═══════════════════════�
 echo ""
 
 cd "$PYTORCH_DIR"
+export PYTHONPATH="$PYTORCH_DIR"
 
 # ── Run each selected test with coverage ──────────────────────
 mkdir -p "$OUT_DIR/cov_parts"
@@ -62,7 +63,7 @@ while IFS= read -r test_path; do
     # Normalize path
     test_path=$(echo "$test_path" | xargs)
     test_path="${test_path#test/}"
-    full_path="$PYTORCH_DIR/test/$test_path"
+    full_path="test/$test_path"
 
     if [[ ! -f "$full_path" ]]; then
         echo "  MISSING: $test_path"
@@ -76,10 +77,10 @@ while IFS= read -r test_path; do
 
     echo "  ► $test_path"
 
-    if timeout "$TIMEOUT" python3 -m pytest \
+    if python3 -m pytest \
         --no-header -q \
         --tb=no \
-        --cov=torch._inductor \
+        --cov=torch._inductor --cov-config=/Users/nihalkumar/pytorch/.coveragerc_tselect \
         --cov-report="" \
         --cov-data-file="$cov_part" \
         "$full_path" \

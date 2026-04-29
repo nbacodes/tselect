@@ -1,0 +1,2 @@
+test/inductor/test_indexing.py
+torch/utils/_sympy/functions.py

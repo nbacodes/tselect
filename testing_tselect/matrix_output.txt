@@ -1,0 +1,127 @@
+Loading graph: /Users/nihalkumar/pytorch/.graph/tselect/dependency_graph.json
+Parsing coverage XML: /Users/nihalkumar/pytorch-pr-176888/coverage_full.xml
+  239 source files with coverage > 0
+
+═══════════════════════════════════════════════════════════════════════════
+  tselect Multi-PR Confusion Matrix (graph-oracle method)
+═══════════════════════════════════════════════════════════════════════════
+
+───────────────────────────────────────────────────────────────────────────
+  PR #145690  [types-only]  Add typing to simd.py
+  Changed : torch/_inductor/codegen/simd.py
+  Oracle  : 491 tests (graph ground truth)
+  Selected: 7 tests (tselect)
+  TP=7  FP=0  FN=484
+  Precision=1.000  Recall=0.014  F1=0.028
+  FN tests (missed by tselect):
+    ✗ test/complex_tensor/utils.py
+    ✗ test/cpp/aoti_inference/test.py
+    ✗ test/cpp_extensions/open_registration_extension/torch_openreg/tests/test_profiler.py
+    ✗ test/custom_operator/test_custom_ops.py
+    ✗ test/distributed/_composable/fsdp/test_fully_shard_autograd.py
+    ... and 479 more
+
+───────────────────────────────────────────────────────────────────────────
+  PR #145691  [types-only]  Add typing to common.py
+  Changed : torch/_inductor/codegen/common.py
+  Oracle  : 493 tests (graph ground truth)
+  Selected: 29 tests (tselect)
+  TP=28  FP=1  FN=465
+  Precision=0.966  Recall=0.057  F1=0.107
+  FN tests (missed by tselect):
+    ✗ test/complex_tensor/utils.py
+    ✗ test/cpp/aoti_inference/test.py
+    ✗ test/cpp_extensions/open_registration_extension/torch_openreg/tests/test_profiler.py
+    ✗ test/custom_operator/test_custom_ops.py
+    ✗ test/distributed/_composable/fsdp/test_fully_shard_autograd.py
+    ... and 460 more
+
+───────────────────────────────────────────────────────────────────────────
+  PR #145692  [types-runtime]  get_backend_features to OrderedSet
+  Changed : torch/_inductor/codegen/common.py, torch/_inductor/scheduler.py
+  Oracle  : 493 tests (graph ground truth)
+  Selected: 15 tests (tselect)
+  TP=15  FP=0  FN=478
+  Precision=1.000  Recall=0.030  F1=0.059
+  FN tests (missed by tselect):
+    ✗ test/complex_tensor/utils.py
+    ✗ test/cpp/aoti_inference/test.py
+    ✗ test/cpp_extensions/open_registration_extension/torch_openreg/tests/test_profiler.py
+    ✗ test/custom_operator/test_custom_ops.py
+    ✗ test/distributed/_composable/fsdp/test_fully_shard_autograd.py
+    ... and 473 more
+
+───────────────────────────────────────────────────────────────────────────
+  PR #152993  [bug-fix]  Fix ModularIndexing assumptions
+  Changed : torch/_inductor/scheduler.py, torch/_inductor/ir.py
+  Oracle  : 491 tests (graph ground truth)
+  Selected: 9 tests (tselect)
+  TP=8  FP=1  FN=483
+  Precision=0.889  Recall=0.016  F1=0.032
+  FN tests (missed by tselect):
+    ✗ test/complex_tensor/utils.py
+    ✗ test/cpp/aoti_inference/test.py
+    ✗ test/cpp_extensions/open_registration_extension/torch_openreg/tests/test_profiler.py
+    ✗ test/custom_operator/test_custom_ops.py
+    ✗ test/distributed/_composable/fsdp/test_fully_shard_autograd.py
+    ... and 478 more
+
+───────────────────────────────────────────────────────────────────────────
+  PR #121953  [bug-fix]  Fix addmm fusion check
+  Changed : torch/_inductor/fx_passes/mkldnn_fusion.py
+  Oracle  : 0 tests (graph ground truth)
+  Selected: 1 tests (tselect)
+  TP=0  FP=1  FN=0
+  Precision=0.000  Recall=N/A  F1=N/A
+  ⚠️  Not in coverage XML (GPU/hardware gate): ['torch/_inductor/fx_passes/mkldnn_fusion.py']
+
+───────────────────────────────────────────────────────────────────────────
+  PR #181666  [feature]  SDK lib fallback cpp-wrapper
+  Changed : torch/_inductor/codecache.py, torch/_inductor/cpp_builder.py
+  Oracle  : 491 tests (graph ground truth)
+  Selected: 3 tests (tselect)
+  TP=3  FP=0  FN=488
+  Precision=1.000  Recall=0.006  F1=0.012
+  FN tests (missed by tselect):
+    ✗ test/complex_tensor/utils.py
+    ✗ test/cpp/aoti_inference/test.py
+    ✗ test/cpp_extensions/open_registration_extension/torch_openreg/tests/test_profiler.py
+    ✗ test/custom_operator/test_custom_ops.py
+    ✗ test/distributed/_composable/fsdp/test_fully_shard_autograd.py
+    ... and 483 more
+
+───────────────────────────────────────────────────────────────────────────
+  PR #181700  [gpu-codegen]  TMA load in fused pointwise epilogues
+  Changed : torch/_inductor/codegen/triton.py, torch/_inductor/ir.py
+  Oracle  : 491 tests (graph ground truth)
+  Selected: 70 tests (tselect)
+  TP=52  FP=18  FN=439
+  Precision=0.743  Recall=0.106  F1=0.185
+  FN tests (missed by tselect):
+    ✗ test/complex_tensor/utils.py
+    ✗ test/cpp/aoti_inference/test.py
+    ✗ test/cpp_extensions/open_registration_extension/torch_openreg/tests/test_profiler.py
+    ✗ test/custom_operator/test_custom_ops.py
+    ✗ test/distributed/_composable/fsdp/test_fully_shard_autograd.py
+    ... and 434 more
+
+═══════════════════════════════════════════════════════════════════════════
+  Aggregate (function-proxy = test-file level)
+───────────────────────────────────────────────────────────────────────────
+  PRs evaluated : 6
+  Total TP      : 113
+  Total FP      : 20
+  Total FN      : 2837
+  Agg Recall    : 0.038
+  Agg Precision : 0.850
+
+  Recall by category:
+    bug-fix             : 0.016
+    feature             : 0.006
+    gpu-codegen         : 0.106
+    types-only          : 0.036
+    types-runtime       : 0.030
+
+═══════════════════════════════════════════════════════════════════════════
+
+Saved: /Users/nihalkumar/Desktop/nbaworks/tselect/tselect_test/matrix_report.json
